@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# venv
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Build artifacts
+*.log
+*.tmp
+.cache/
+
+# Model weights (do not push)
+*.safetensors
+*.bin
+*.gguf
+*.pt
+*.pth
+*.bak
