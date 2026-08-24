@@ -34,7 +34,7 @@ def _load_nccl_module() -> Module:
 def _get_pynccl_wrapper_cls():
     import tvm_ffi
 
-    @tvm_ffi.register_object("prometheus.NCCLWrapper")
+    @tvm_ffi.register_object("freetoken.NCCLWrapper")
     class PyNCCLImpl(tvm_ffi.Object):
         def __init__(self, *args):
             self.__ffi_init__(*args)
