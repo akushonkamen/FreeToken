@@ -37,6 +37,17 @@ def default_profile_path() -> str:
     return os.path.join(cache, "prometheus", "benchbw.json")
 
 
+def _legacy_profile_paths() -> list[str]:
+    """Cache locations written by builds from before the freetoken->prometheus rename.
+
+    Read-only fallbacks for the (common) upgraded-install case: the machine still holds a
+    perfectly good profile under the old cache dir, and silently ignoring it degrades the
+    hybrid fetch split to the fixed cap of 1. ``benchbw`` itself never writes here.
+    """
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return [os.path.join(cache, "freetoken", "benchbw.json")]
+
+
 def _load(path: str) -> dict | None:
     try:
         with open(path) as f:
@@ -53,6 +64,14 @@ def _usable_profile(gpu_name: str | None, path: str | None) -> dict | None:
     """
     src = path or os.environ.get("PROMETHEUS_BENCHBW_PATH") or default_profile_path()
     prof = _load(src)
+    if prof is None and path is None and "PROMETHEUS_BENCHBW_PATH" not in os.environ:
+        # No explicit location was asked for and the canonical file is absent: try the
+        # pre-rename cache dirs before giving up (see _legacy_profile_paths).
+        for legacy in _legacy_profile_paths():
+            legacy_prof = _load(legacy)
+            if legacy_prof is not None:
+                src, prof = legacy, legacy_prof
+                break
     if not isinstance(prof, dict):
         return None
     prof_gpu = (prof.get("gpu") or {}).get("name")
