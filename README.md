@@ -1,11 +1,3 @@
-<div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/prometheus-logo-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="assets/prometheus-logo-light.svg">
-    <img alt="Prometheus" src="assets/prometheus-logo.svg" width=65%>
-  </picture>
-</div>
-
 # Prometheus
 
 ## Installation
