@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Prometheus Playground</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; background: #0f1117; color: #e4e4e7; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* top bar */
+  #topbar { display: flex; align-items: center; gap: 10px; padding: 10px 16px; background: #16181f; border-bottom: 1px solid #27272a; flex-shrink: 0; }
+  #topbar .logo { font-weight: 700; color: #fff; }
+  #topbar .logo i { color: #3b82f6; font-style: normal; }
+  #topbar .spacer { flex: 1; }
+  .ctl { background: #1f2027; border: 1px solid #27272a; color: #e4e4e7; padding: 5px 10px; border-radius: 6px; font-size: 13px; }
+  .ctl:focus { outline: none; border-color: #3b82f6; }
+  select.ctl { cursor: pointer; }
+  input.ctl[type=number] { width: 72px; }
+  #topbar label { color: #71717a; font-size: 12px; }
+
+  /* main split */
+  #main { flex: 1; display: flex; min-height: 0; }
+
+  /* chat column */
+  #chat-col { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 14px; gap: 10px; }
+  #log { flex: 1; overflow-y: auto; background: #16181f; border: 1px solid #27272a; border-radius: 10px; padding: 16px; }
+  .msg { margin-bottom: 14px; }
+  .msg .role { font-size: 11px; color: #71717a; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .msg .body { white-space: pre-wrap; word-wrap: break-word; }
+  .msg.assistant .body { color: #d4d4d8; }
+  .msg.user .body { color: #93c5fd; }
+  .msg .thinking { background: #1a1a22; border: 1px solid #3f3f46; border-radius: 6px; margin-bottom: 8px; }
+  .msg .thinking-head { padding: 6px 10px; cursor: pointer; user-select: none; display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #71717a; }
+  .msg .thinking-head:hover { color: #a1a1aa; }
+  .msg .thinking-head .arrow { transition: transform 0.15s; }
+  .msg .thinking.expanded .arrow { transform: rotate(90deg); }
+  .msg .thinking-body { display: none; padding: 8px 10px; border-top: 1px solid #3f3f46; color: #71717a; font-size: 12px; white-space: pre-wrap; word-wrap: break-word; max-height: 300px; overflow-y: auto; }
+  .msg .thinking.expanded .thinking-body { display: block; }
+  .msg .thinking .pulse { width: 6px; height: 6px; background: #3b82f6; border-radius: 50%; animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .msg .thinking.done .pulse { background: #10b981; animation: none; }
+
+  #input-card { background: #16181f; border: 1px solid #27272a; border-radius: 10px; padding: 10px; flex-shrink: 0; }
+  #prompt { width: 100%; background: transparent; border: none; color: #e4e4e7; font: inherit; resize: none; height: 64px; }
+  #prompt:focus { outline: none; }
+  #input-foot { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+  #input-foot .hint { color: #52525b; font-size: 11px; flex: 1; }
+  #send { padding: 7px 22px; background: #3b82f6; color: #fff; border: none; border-radius: 7px; cursor: pointer; font-weight: 600; font-size: 13px; }
+  #send:disabled { background: #3f3f46; cursor: not-allowed; }
+
+  /* sidebar */
+  #sidebar { width: 292px; flex-shrink: 0; border-left: 1px solid #27272a; background: #13151b; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 12px; }
+  .card { background: #16181f; border: 1px solid #27272a; border-radius: 8px; padding: 10px 12px; }
+  .card h3 { font-size: 10px; color: #71717a; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; font-weight: 600; }
+  .row { display: flex; justify-content: space-between; font-size: 12px; font-family: "SF Mono", Menlo, monospace; padding: 2px 0; }
+  .row .k { color: #a1a1aa; }
+  .row .v { color: #e4e4e7; font-variant-numeric: tabular-nums; }
+  .row .v.hl { color: #60a5fa; font-weight: 600; }
+  .bar { height: 4px; background: #27272a; border-radius: 2px; margin: 3px 0 6px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: #3b82f6; transition: width 0.3s; }
+  .bar.gpu > i { background: #10b981; }
+  .bar.mem > i { background: #f59e0b; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: 10px; font-weight: 600; }
+  .badge.up { background: #064e3b; color: #34d399; }
+  .badge.down { background: #450a0a; color: #f87171; }
+  .bench-tbl { width: 100%; border-collapse: collapse; font-size: 11px; font-family: "SF Mono", Menlo, monospace; }
+  .bench-tbl th { color: #71717a; text-align: left; font-weight: 500; padding: 2px 4px; border-bottom: 1px solid #27272a; }
+  .bench-tbl td { padding: 3px 4px; color: #e4e4e7; font-variant-numeric: tabular-nums; }
+  .bench-tbl td.b { color: #a1a1aa; }
+  .bench-tbl tr.best td { color: #34d399; }
+  .updated { font-size: 10px; color: #52525b; text-align: right; font-family: "SF Mono", Menlo, monospace; margin-top: 6px; }
+  #bench-refresh { background: none; border: none; color: #71717a; font-size: 11px; cursor: pointer; padding: 0; }
+  #bench-refresh:hover { color: #fff; }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <span class="logo">Prom<i>etheus</i></span>
+  <select id="model-name" class="ctl"><option>loading…</option></select>
+  <span id="model-name-label" style="color:#71717a;font-size:12px"></span>
+  <span class="spacer"></span>
+  <label>Reasoning</label>
+  <select id="reasoning-effort" class="ctl">
+    <option value="">default</option>
+    <option value="low">low</option>
+    <option value="high">high</option>
+    <option value="max">max</option>
+  </select>
+  <label>Temp</label>
+  <input type="number" id="temp" class="ctl" value="1.0" step="0.1" min="0" max="2">
+  <label>Max tok</label>
+  <input type="number" id="max-tokens" class="ctl" value="512" step="64" min="1">
+</div>
+
+<div id="main">
+  <div id="chat-col">
+    <div id="log"></div>
+    <div id="input-card">
+      <textarea id="prompt" placeholder="Message…"></textarea>
+      <div id="input-foot">
+        <span class="hint">Enter 发送 · Shift+Enter 换行</span>
+        <button id="send">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="sidebar">
+    <div class="card">
+      <h3>Last Request</h3>
+      <div class="row"><span class="k">tok/s</span><span class="v hl" id="lr-toks">--</span></div>
+      <div class="row"><span class="k">TTFT</span><span class="v" id="lr-ttft">--</span></div>
+      <div class="row"><span class="k">tokens</span><span class="v" id="lr-tokens">--</span></div>
+      <div class="row"><span class="k">duration</span><span class="v" id="lr-dur">--</span></div>
+    </div>
+
+    <div class="card">
+      <h3 style="display:flex;justify-content:space-between;align-items:center">Benchmarks <button id="bench-refresh">refresh</button></h3>
+      <table class="bench-tbl">
+        <thead><tr><th>backend</th><th>tok/s</th><th>ms/tok</th><th>TTFT</th><th>VRAM</th></tr></thead>
+        <tbody id="bench-body"><tr><td colspan="5" style="color:#71717a">no data</td></tr></tbody>
+      </table>
+      <div class="updated" id="bench-updated"></div>
+    </div>
+
+    <div class="card">
+      <h3>GPU 0 · RTX 4090</h3>
+      <div class="row"><span class="k">Util</span><span class="v" id="gpu-util">--</span></div>
+      <div class="bar gpu"><i id="gpu-util-bar" style="width:0%"></i></div>
+      <div class="row"><span class="k">VRAM</span><span class="v" id="gpu-vram">--</span></div>
+      <div class="bar mem"><i id="gpu-vram-bar" style="width:0%"></i></div>
+      <div class="row"><span class="k">Temp / Power</span><span class="v" id="gpu-tp">--</span></div>
+    </div>
+
+    <div class="card">
+      <h3>CPU · 128 cores</h3>
+      <div class="row"><span class="k">Util</span><span class="v" id="cpu-util">--</span></div>
+      <div class="bar"><i id="cpu-util-bar" style="width:0%"></i></div>
+      <div class="row"><span class="k">us / sy</span><span class="v" id="cpu-ussy">--</span></div>
+      <div class="row"><span class="k">Load 1m</span><span class="v" id="cpu-load">--</span></div>
+      <div class="row"><span class="k">Mem</span><span class="v" id="mem-used">--</span></div>
+      <div class="bar mem"><i id="mem-bar" style="width:0%"></i></div>
+    </div>
+
+    <div class="card">
+      <h3>Server</h3>
+      <div class="row"><span class="k">Status</span><span class="v"><span class="badge down" id="proc-status">--</span></span></div>
+      <div class="row"><span class="k">PID</span><span class="v" id="proc-pid">--</span></div>
+      <div class="row"><span class="k">CPU%</span><span class="v" id="proc-cpu">--</span></div>
+      <div class="row"><span class="k">RSS</span><span class="v" id="proc-rss">--</span></div>
+      <div class="row"><span class="k">Uptime</span><span class="v" id="proc-etime">--</span></div>
+      <div class="updated" id="stats-updated">未刷新</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+
+function apiBase() {
+  const v = ($('#api-base') || {}).value || '';
+  const t = (v && v.trim()) || '';
+  return t ? t.replace(/\/+$/, '') : '';
+}
+
+async function loadModels() {
+  try {
+    const r = await fetch(apiBase() + '/v1/models');
+    const j = await r.json();
+    const sel = $('#model-name');
+    sel.innerHTML = '';
+    (j.data || []).forEach(m => {
+      const o = document.createElement('option');
+      o.value = o.text = m.id;
+      sel.appendChild(o);
+    });
+    $('#model-name-label').textContent = (j.data?.length || 0) + ' model(s)';
+  } catch (e) { console.error(e); }
+}
+loadModels();
+
+function addMsg(role, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + role;
+  d.innerHTML = `<div class="role">${role}</div>
+    <div class="thinking" style="display:none">
+      <div class="thinking-head"><span style="display:flex;align-items:center;gap:6px"><span class="pulse"></span>thinking</span><span class="arrow">▸</span></div>
+      <div class="thinking-body"></div>
+    </div>
+    <div class="body"></div>`;
+  d.querySelector('.body').textContent = text;
+  d.querySelector('.thinking-head').onclick = () => d.querySelector('.thinking').classList.toggle('expanded');
+  $('#log').appendChild(d);
+  $('#log').scrollTop = $('#log').scrollHeight;
+  return { body: d.querySelector('.body'), thinking: d.querySelector('.thinking'), thinkingBody: d.querySelector('.thinking-body') };
+}
+
+let sending = false;
+$('#send').onclick = async () => {
+  if (sending) return;
+  sending = true; $('#send').disabled = true;
+  const prompt = $('#prompt').value.trim();
+  if (!prompt) { sending = false; $('#send').disabled = false; return; }
+  addMsg('user', prompt);
+  $('#prompt').value = '';
+  const { body: out, thinking, thinkingBody } = addMsg('assistant', '');
+  let inThinking = false;
+
+  // per-request live metrics
+  const t0 = performance.now();
+  let ttftMs = null, firstTokAt = null, tokCount = 0;
+  const fmtDur = ms => ms < 1000 ? ms.toFixed(0) + ' ms' : (ms / 1000).toFixed(1) + ' s';
+  const updateLive = () => {
+    const now = performance.now();
+    if (ttftMs !== null) {
+      $('#lr-ttft').textContent = fmtDur(ttftMs);
+      const span = now - firstTokAt;
+      $('#lr-toks').textContent = span > 200 ? (tokCount / (span / 1000)).toFixed(1) : '--';
+      $('#lr-tokens').textContent = tokCount;
+      $('#lr-dur').textContent = fmtDur(now - t0);
+    } else {
+      $('#lr-toks').textContent = 'thinking…';
+      $('#lr-dur').textContent = fmtDur(now - t0);
+    }
+  };
+  const liveTimer = setInterval(updateLive, 250);
+
+  try {
+    const payload = {
+      model: $('#model-name').value,
+      messages: [{role: 'user', content: prompt}],
+      temperature: parseFloat($('#temp').value),
+      max_tokens: parseInt($('#max-tokens').value),
+      stream: true
+    };
+    const re = $('#reasoning-effort').value;
+    if (re) payload.reasoning_effort = re;
+    const r = await fetch(apiBase() + '/v1/chat/completions', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    if (!r.ok) { out.textContent = 'HTTP ' + r.status + ' ' + (await r.text()); return; }
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    let pendingScroll = false;
+    const scrollToBottom = () => {
+      if (pendingScroll) return;
+      pendingScroll = true;
+      requestAnimationFrame(() => {
+        $('#log').scrollTop = $('#log').scrollHeight;
+        pendingScroll = false;
+      });
+    };
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      const lines = buf.split(/\r?\n/); buf = lines.pop() || '';
+      for (const ln of lines) {
+        if (!ln.startsWith('data: ')) continue;
+        const data = ln.slice(6).trim();
+        if (data === '[DONE]' || !data) continue;
+        try {
+          const j = JSON.parse(data);
+          const delta = j.choices?.[0]?.delta || {};
+          if (delta.reasoning_content || delta.content) {
+            if (ttftMs === null) { ttftMs = performance.now() - t0; firstTokAt = performance.now(); }
+            tokCount++;
+          }
+          if (delta.reasoning_content) {
+            if (!inThinking) { inThinking = true; thinking.style.display = ''; thinking.classList.add('expanded'); }
+            thinkingBody.appendChild(document.createTextNode(delta.reasoning_content));
+            scrollToBottom();
+          }
+          if (delta.content) {
+            if (inThinking) { inThinking = false; thinking.classList.remove('expanded'); thinking.classList.add('done'); }
+            out.appendChild(document.createTextNode(delta.content));
+            scrollToBottom();
+          }
+        } catch (e) {}
+      }
+    }
+    if (inThinking) { thinking.classList.add('done'); thinking.classList.remove('expanded'); }
+    updateLive();
+  } catch (e) { out.textContent = 'Error: ' + e.message; }
+  finally { clearInterval(liveTimer); updateLive(); sending = false; $('#send').disabled = false; }
+};
+
+$('#prompt').onkeydown = e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('#send').click(); }
+};
+
+/* ---------- benchmarks ---------- */
+function currentModel() { return ($('#model-name') || {}).value || ''; }
+async function loadBench() {
+  const model = currentModel();
+  const tb = $('#bench-body');
+  if (!model) { tb.innerHTML = '<tr><td colspan="5" style="color:#71717a">no model</td></tr>'; $('#bench-updated').textContent = ''; return; }
+  const backends = ['offload', 'cpu', 'hybrid'];
+  const rows = [];
+  for (const b of backends) {
+    try {
+      const r = await fetch(`/bench/${encodeURIComponent(model)}/${b}`);
+      if (!r.ok) continue;
+      rows.push(await r.json());
+    } catch (e) {}
+  }
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="5" style="color:#71717a">no data</td></tr>';
+    $('#bench-updated').textContent = model + ' · 0 backends';
+    return;
+  }
+  const best = Math.max(...rows.map(r => r.decode_tok_s || 0));
+  tb.innerHTML = rows.map(j => `
+    <tr class="${j.decode_tok_s === best ? 'best' : ''}">
+      <td class="b">${j.backend}</td>
+      <td>${(j.decode_tok_s||0).toFixed(1)}</td>
+      <td>${(j.ms_per_token||0).toFixed(0)}</td>
+      <td>${((j.ttft_ms||0)/1000).toFixed(1)}s</td>
+      <td>${(j.vram_gib||0).toFixed(1)}G</td>
+    </tr>`).join('');
+  $('#bench-updated').textContent = model + ' · ' + rows.length + ' backends';
+}
+$('#bench-refresh').onclick = loadBench;
+$('#model-name').addEventListener('change', loadBench);
+loadBench();
+
+/* ---------- stats ---------- */
+function fmt(n, d=1) { return Number(n).toFixed(d); }
+function setBar(id, pct) { const el = $('#' + id); if (el) el.style.width = Math.max(0, Math.min(100, pct)) + '%'; }
+function setTxt(id, t) { const el = $('#' + id); if (el) el.textContent = t; }
+
+async function loadStats() {
+  try {
+    const r = await fetch('/stats');
+    if (!r.ok) { setTxt('proc-status', 'SSH ERR'); $('#proc-status').className = 'badge down'; return; }
+    const txt = await r.text();
+    const sections = {};
+    let cur = null;
+    for (const ln of txt.split('\n')) {
+      const m = ln.match(/^===(\w+)===/);
+      if (m) { cur = m[1]; continue; }
+      if (cur) (sections[cur] = sections[cur] || []).push(ln);
+    }
+
+    const g = (sections.GPU || [])[0] || '';
+    const parts = g.split(',').map(s => s.trim());
+    if (parts.length >= 8 && parts[0] === '0') {
+      const vu = +parts[2], vt = +parts[3];
+      setTxt('gpu-util', fmt(parts[4], 0) + '%');
+      setBar('gpu-util-bar', +parts[4]);
+      setTxt('gpu-vram', `${(vu/1024).toFixed(1)} / ${(vt/1024).toFixed(1)} GiB`);
+      setBar('gpu-vram-bar', vu / vt * 100);
+      setTxt('gpu-tp', parts[6] + ' °C · ' + parts[7] + ' W');
+    }
+
+    const cpu = (sections.CPU || []);
+    if (cpu[1]) {
+      const la = cpu[1].trim().split(/\s+/);
+      setTxt('cpu-load', la[0] + ' / ' + (cpu[0] || '?'));
+    }
+    const topLine = (cpu.filter(x => x.startsWith('%Cpu')))[0] || '';
+    const m = topLine.match(/([\d.]+)\s*us,\s*([\d.]+)\s*sy,\s*([\d.]+)\s*ni,\s*([\d.]+)\s*id/);
+    if (m) {
+      const us = +m[1], sy = +m[2], ni = +m[3];
+      const util = us + sy + ni;
+      setTxt('cpu-util', util.toFixed(1) + '%');
+      setBar('cpu-util-bar', util);
+      setTxt('cpu-ussy', us.toFixed(1) + ' / ' + sy.toFixed(1) + ' %');
+    }
+
+    const mem = (sections.MEM || [])[1] || '';
+    const mt = mem.trim().split(/\s+/);
+    if (mt.length >= 4) {
+      const total = +mt[1], used = +mt[2];
+      setTxt('mem-used', (used/1024/1024).toFixed(0) + ' / ' + (total/1024/1024).toFixed(0) + ' GiB');
+      setBar('mem-bar', used / total * 100);
+    }
+
+    const p = ((sections.PROC || []).filter(x => x.trim()))[0] || '';
+    if (p) {
+      const [pid, pcpu, pmem, rss, etime] = p.trim().split(/\s+/);
+      setTxt('proc-status', 'UP'); $('#proc-status').className = 'badge up';
+      setTxt('proc-pid', pid);
+      setTxt('proc-cpu', pcpu + '%');
+      setTxt('proc-rss', (rss/1024/1024).toFixed(1) + ' GiB');
+      setTxt('proc-etime', etime);
+    } else {
+      setTxt('proc-status', 'DOWN'); $('#proc-status').className = 'badge down';
+      ['proc-pid','proc-cpu','proc-rss','proc-etime'].forEach(x => setTxt(x, '-'));
+    }
+    setTxt('stats-updated', new Date().toLocaleTimeString());
+  } catch (e) {
+    setTxt('proc-status', 'ERR'); $('#proc-status').className = 'badge down';
+  }
+}
+loadStats();
+setInterval(loadStats, 2000);
+</script>
+</body>
+</html>
