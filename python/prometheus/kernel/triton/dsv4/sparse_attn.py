@@ -10,14 +10,14 @@ pool ``window_pool[n_win_slots, d]`` and the compressed pool ``cmp_pool[n_cmp, d
 (both batch-less, addressed by physical slot). Per (request, query) the top-k is a
 list of GLOBAL slots laid out ``[window part | compressed part]``: entry ``topk[j]``
 loads from ``window_pool`` when ``j < n_window`` else from ``cmp_pool`` (``-1`` is
-masked). This mirrors sglang's FlashMLA backend, which takes global page indices
+masked). This mirrors our MLA backend, which takes global page indices
 directly -- no per-forward ``index_select`` staging slab.
 
 ``topk_idxs``' width is a STATIC buffer width (a CUDA-graph capture bakes it), but the
 number of columns a replay must actually visit is not: pass ``cmp_counts`` (a device
 ``[b, m]`` int32 tensor of per-query VALID compressed columns) and the kernel reads its
 loop bound from memory instead of walking the whole buffer. This is the same contract as
-sglang's ``flash_mla_with_kvcache(indices=..., topk_length=...)``. Without it the loop
+our MLA path with ``indices=..., topk_length=...``. Without it the loop
 covers the full width, which is correct but pays for every ``-1`` column.
 
 Two implementations, picked from the launch shape -- there is no knob:
