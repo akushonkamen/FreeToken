@@ -401,6 +401,10 @@ class MTPDraftManager:
 
     def remove(self, uid: int) -> None:
         self.states.pop(uid, None)
+        # Ineligibility is per-request, not per-uid: the offline LLM API renumbers
+        # uids from 0 on every generate() call, so a stale entry here would poison
+        # every later request that reuses the uid (spec stays off forever).
+        self._ineligible.discard(uid)
 
     def seat_drafts(self, reqs: List["Req"], k: int) -> List[torch.Tensor] | None:
         """Trim each state's pending chain to the seatable draft (budget-capped) and
