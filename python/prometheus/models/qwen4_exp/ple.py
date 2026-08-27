@@ -99,7 +99,7 @@ class Qwen4PleEmbedding(BaseOP):
         # _-prefixed: kept out of the BaseOP state dict. The checkpoint ships only
         # layer_multipliers (persistent nn.Buffer in HF); the head sizes/offsets are
         # never saved -- both are pure functions of the config, computed here.
-        self._layer_multipliers = torch.tensor(multipliers, dtype=torch.int64)
+        self._layer_multipliers = torch.tensor(multipliers, dtype=torch.int64, device="cpu")
         head_vocab_sizes = []
         head_offsets = []
         total = 0
@@ -109,8 +109,8 @@ class Qwen4PleEmbedding(BaseOP):
             head_vocab_sizes.append(size)
             head_offsets.append(total)
             total += size
-        self._ngram_heads_vocab_sizes = torch.tensor(head_vocab_sizes, dtype=torch.int64)
-        self._ngram_heads_offsets = torch.tensor(head_offsets, dtype=torch.int64)
+        self._ngram_heads_vocab_sizes = torch.tensor(head_vocab_sizes, dtype=torch.int64, device="cpu")
+        self._ngram_heads_offsets = torch.tensor(head_offsets, dtype=torch.int64, device="cpu")
         self._ngram_heads = ngram_heads
         self._hpg = args.heads_per_ngram  # heads per ngram order (bigram, trigram)
         self._head_dim = head_dim_per_ngram
