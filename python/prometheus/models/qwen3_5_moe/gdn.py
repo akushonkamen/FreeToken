@@ -32,16 +32,17 @@ class _GatedRMSNorm(BaseOP):
     kernel) instead of the unfused pow/mean/rsqrt/mul/silu chain, matching sglang's
     ``RMSNormGated`` -- collapses ~8 elementwise kernels per GDN layer into one."""
 
-    def __init__(self, dim: int, eps: float):
+    def __init__(self, dim: int, eps: float, activation: str = "silu"):
         self.weight = torch.empty(dim)
         self.eps = eps
+        self.activation = activation
 
     def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         from prometheus.kernel.fla import rms_norm_gated
 
         return rms_norm_gated(
             x=x, weight=self.weight, bias=None, z=z, eps=self.eps,
-            is_rms_norm=True, norm_before_gate=True, activation="silu",
+            is_rms_norm=True, norm_before_gate=True, activation=self.activation,
         )
 
 
@@ -59,7 +60,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, expert_quant: str = "none",
         attn_quant: str = "none", in_proj_split: bool = False,
-        in_proj_nvfp4: bool = False,
+        in_proj_nvfp4: bool = False, gate_activation: str = "silu",
     ):
         self.layer_id = layer_id
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
@@ -123,7 +124,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # *.A_log / *.dt_bias from the model-dtype downcast.
         self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
         self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
-        self.norm = _GatedRMSNorm(head_v_dim, eps=rms_norm_eps)
+        self.norm = _GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=gate_activation)
         # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
         # NVFP4 (W4A16) / bf16. in_proj_ba stays bf16 in every mode (above); a compressed-
         # tensors NVFP4 checkpoint with packed in_proj parts (_nvfp4_qkvz) also makes qkvz
