@@ -84,7 +84,17 @@ class Qwen3_5Attention(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         q, k, v, gate = self._project(x)
-        o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
+        # Spec-verify batches (phase=prefill, 1+k rows) route to the dedicated triton
+        # spec backend when MTP spec is on: its varlen-extend path reads all metadata
+        # from device tensors with a shape-only grid, so the fixed-shape verify forward
+        # is CUDA-graph capturable (GraphRunner spec graph). The fi backend's prefill
+        # wrapper plans host-side per call and is not capturable.
+        backend = (
+            ctx.spec_attn_backend
+            if ctx.spec_attn_backend is not None and ctx.batch.spec_verify
+            else ctx.attn_backend
+        )
+        o = backend.forward(q, k, v, self.layer_id, ctx.batch)
         return self._combine(o, gate)
 
 

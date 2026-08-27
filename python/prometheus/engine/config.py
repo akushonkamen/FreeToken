@@ -56,6 +56,16 @@ class EngineConfig:
     moe_hybrid_max_fetch: int = -1
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
+    # n-gram speculative decoding draft length (--spec-ngram K). 0 = off (every spec
+    # branch is a plain bool check away). K > 0 verifies 1+K tokens per greedy decode
+    # step in one forward; auto-disabled for models whose state cannot roll back
+    # (GDN/linear attention) or when page_size != 1.
+    spec_ngram: int = 0
+    # MTP (multi-token prediction) draft head speculative decoding (--spec-mtp K):
+    # the checkpoint's bf16 mtp.* layer chains K draft tokens, verified with the same
+    # greedy longest-prefix machinery as --spec-ngram (output identical to plain
+    # greedy). Requires a checkpoint with an MTP head; 0 = off (zero code paths).
+    spec_mtp: int = 0
     page_size: int = 1
     memory_ratio: float = 0.9
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);

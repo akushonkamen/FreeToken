@@ -53,6 +53,25 @@ def _gdn_split_layout(model_path: str | None) -> bool:
     return False
 
 
+def _gdn_in_proj_packed(model_path: str | None) -> bool:
+    """Whether the checkpoint stores the unfused GDN ``in_proj_{qkv,z,b,a}`` parts as
+    compressed-tensors packed NVFP4 (``in_proj_qkv.weight_packed``) rather than bf16
+    ``.weight`` -- the model then keeps qkv|z native (W4A16) instead of dequantizing
+    them to bf16 at load. Probes the same shard order as ``_gdn_split_layout``; the
+    packed suffix wins so a mixed shard can never read as bf16."""
+    if model_path is None:
+        return False
+    import safetensors
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+            keys = list(f.keys())
+            if any(k.endswith(".linear_attn.in_proj_qkv.weight_packed") for k in keys):
+                return True
+            if any(k.endswith(".linear_attn.in_proj_qkv.weight") for k in keys):
+                return False
+    return False
+
+
 def _fp8_block_quant(hf_config: Any) -> tuple[str, tuple[int, int] | None]:
     """Detect DeepSeek-V3-style 128x128 block-fp8 from HF ``quantization_config``.
 
@@ -295,6 +314,7 @@ def parse_config(hf_config: Any, model_path: str | None = None) -> ModelConfig:
         conv_kernel_dim=text.linear_conv_kernel_dim,
         output_gate=True,
         in_proj_split=_gdn_split_layout(model_path),
+        in_proj_nvfp4=_gdn_in_proj_packed(model_path),
     )
     # Order groups by their first layer id for deterministic iteration.
     groups = tuple(

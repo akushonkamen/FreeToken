@@ -161,6 +161,10 @@ class LinearGatedDeltaGroupConfig(BaseAttentionGroupConfig):
     # Checkpoint ships the GDN input projection pre-fused as bf16 ``in_proj_qkvz`` +
     # ``in_proj_ba`` (Qwen3-Next modelopt NVFP4) instead of the four unfused parts.
     in_proj_split: bool = False
+    # Checkpoint stores the (unfused) GDN ``in_proj_{qkv,z,b,a}`` parts as compressed-tensors
+    # packed NVFP4 (``in_proj_qkv.weight_packed``) instead of bf16: qkv|z are then served by
+    # the native W4A16 kernel rather than dequantized to bf16 at load.
+    in_proj_nvfp4: bool = False
 
 
 @dataclass(frozen=True)
@@ -294,6 +298,10 @@ class ModelConfig:
     # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine
     # code; None for every other model.
     m3_args: Any | None = None
+    # Qwen4-exp (qwen4_exp) payload (Qwen4ExpArgs): hyper-connection geometry,
+    # PLE n-gram embedding params, QSA indexer geometry. Opaque to model-agnostic
+    # engine code; None for every other model.
+    q4_args: Any | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1

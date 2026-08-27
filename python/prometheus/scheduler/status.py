@@ -35,7 +35,21 @@ class SchedulerStatusReporter:
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
     ) -> None:
-        if batch.is_prefill:
+        if batch.spec_verify:
+            # Spec-verify batches ARE decode steps (one forward, several committed
+            # tokens); report them through the decode line so cadence/throughput
+            # logging keeps working during spec decode.
+            self._report_decode(
+                batch,
+                running_reqs=running_reqs,
+                queue_reqs=queue_reqs,
+                kv_used_pages=kv_used_pages,
+                kv_total_pages=kv_total_pages,
+                page_size=page_size,
+                mamba_slots=mamba_slots,
+                swa_tokens=swa_tokens,
+            )
+        elif batch.is_prefill:
             self._report_prefill(
                 batch,
                 running_reqs=running_reqs,

@@ -230,7 +230,14 @@ class OffloadMoELayer(MoELayer):
         router_logits: torch.Tensor | None = None,
     ):
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        if ctx.batch.spec_verify:
+            # Spec-verify batch: phase is "prefill" for attention, but ride the DECODE
+            # MoE path -- per-token ensure_experts through the slot cache is correct
+            # for any token count and keeps PCIe traffic O(active experts), while the
+            # prefill path streams whole expert layers and would erase the multi-token
+            # amortization spec exists to provide.
+            final_hidden_states = self.decode_forward(hidden_states, router_logits)
+        elif ctx.batch.is_prefill:
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
@@ -250,7 +257,10 @@ class OffloadMoELayer(MoELayer):
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
         """
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        if ctx.batch.spec_verify:
+            # same rationale as forward(): slot-cache decode path, token-count agnostic
+            out = self._decode_routed(hidden_states, topk_weights, topk_ids)
+        elif ctx.batch.is_prefill:
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)

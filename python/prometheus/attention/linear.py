@@ -77,7 +77,15 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     fresh = [gdn_slot(r) for r in reqs if r.cached_len == 0]
     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
 
-    track_dst, track_h_row, track_conv_src = _build_track_metadata(reqs, cu_host, device, pin)
+    # Never track inside a spec-verify/replay span: a mid-span boundary snapshot would
+    # capture state that already absorbed unverified draft tokens, and donating it to
+    # the radix tree would poison future prefix hits. Only reachable with k >= CHUNK
+    # (the spec span is 1+k tokens), but guard unconditionally.
+    track_dst, track_h_row, track_conv_src = (
+        (None, None, None)
+        if batch.spec_verify
+        else _build_track_metadata(reqs, cu_host, device, pin)
+    )
 
     return FLAMetadata(
         cu_seqlens=cu_host.to(device, non_blocking=True),

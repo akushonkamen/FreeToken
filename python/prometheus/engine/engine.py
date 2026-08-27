@@ -321,6 +321,16 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        # MTP draft head (--spec-mtp): built from the checkpoint's bf16 mtp.* tensors
+        # and kept full-resident with the model weights (its VRAM counts against the
+        # weights baseline below, before any runtime pool is budgeted).
+        self.mtp_draft = None
+        if getattr(config, "spec_mtp", 0) > 0:
+            build = getattr(self.model, "build_mtp_draft", None)
+            if build is None:
+                raise ValueError("--spec-mtp: this model has no MTP draft-head support")
+            self.mtp_draft = build(config.model_path, self.device)
+            logger.info_rank0("MTP draft head loaded (spec-mtp)")
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -382,6 +392,17 @@ class Engine:
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
+        # MTP spec-verify backend: a triton instance serving spec-verify batches only
+        # (see Qwen3_5Attention routing), whose device-tensor varlen-extend path keeps
+        # the fixed-shape verify forward CUDA-graph capturable. The primary backend
+        # keeps serving every non-spec forward unchanged.
+        self.spec_attn = None
+        if getattr(config, "spec_mtp", 0) > 0:
+            from prometheus.attention.triton import TritonAttentionBackend
+
+            self.spec_attn = TritonAttentionBackend(config.model_config)
+            self.ctx.spec_attn_backend = self.spec_attn
+            logger.info_rank0("Spec-verify triton attention backend enabled (spec-mtp)")
         if config.model_config.is_moe:
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
 
@@ -417,6 +438,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            spec_ext=(1 + config.spec_mtp) if getattr(config, "spec_mtp", 0) > 0 else None,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -635,8 +657,16 @@ class Engine:
                 f"(MoE layer {type(sample).__name__} is missing {required})."
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
-        # round a batch up to the largest captured size; cover both.
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        # round a batch up to the largest captured size; cover both. A spec-verify
+        # batch carries 1+k tokens per request, so its rows are bounded by
+        # max_running_req * (1+k) (only grows the pinned IO buffers).
+        max_tokens = max(
+            config.max_running_req
+            * (1 + max(getattr(config, "spec_ngram", 0), getattr(config, "spec_mtp", 0))),
+            config.max_running_req,
+            config.cuda_graph_max_bs or 0,
+            1,
+        )
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
             cache,
@@ -858,19 +888,43 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            spec_ext=(1 + config.spec_mtp) if getattr(config, "spec_mtp", 0) > 0 else None,
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        spec_graphed = False
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
+            elif batch.spec_verify and self.graph_runner.can_use_spec_graph(batch):
+                # Captured spec-verify forward: one replay covers model.forward() +
+                # argmax; replay_spec re-points batch.hidden_states/spec_gdn_stash at
+                # the graph-pool tensors for the drain.
+                next_tokens_gpu = self.graph_runner.replay_spec(batch)
+                spec_graphed = True
             else:
                 logits = self.model.forward()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
+
+        if batch.spec_verify:
+            # Spec-verify: logits cover EVERY extend position (lm_head kept them all).
+            # One flat greedy argmax over the [sum(1+k), vocab] rows is the candidate
+            # set; the scheduler-side drain commits the longest matching draft prefix.
+            # No sampler and no complete_one -- cached/device lens are rolled back or
+            # advanced per-request in Scheduler._verify_spec_draft (KV rollback).
+            # complete_one MUST NOT run here: it would fold the whole unverified span
+            # (cached_len = m+1+k) into the req before the drain decides how many
+            # positions survive, desynchronizing its slot frees and row slicing.
+            if not spec_graphed:
+                next_tokens_gpu = torch.argmax(logits, dim=-1).to(torch.int32)
+            next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+            copy_done_event = torch.cuda.Event()
+            copy_done_event.record(self.stream)
+            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
         for req in batch.reqs:
             req.complete_one()

@@ -8,9 +8,14 @@ from prometheus.layers import BaseOP, LinearColParallelMerged
 
 from prometheus.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 from prometheus.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
+from prometheus.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged
 
 from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
 from .quant_linear import make_replicated_quant
+
+# Device-side const tensors for GDN spec readvance (see Qwen3_5GatedDeltaNet.
+# spec_readvance): (rows, slot, device_index) -> (cu, idx, has_init).
+_SPEC_READVANCE_CONSTS: dict = {}
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -54,6 +59,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, expert_quant: str = "none",
         attn_quant: str = "none", in_proj_split: bool = False,
+        in_proj_nvfp4: bool = False,
     ):
         self.layer_id = layer_id
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
@@ -77,15 +83,27 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self._block_fp8 = expert_quant == "fp8_block"
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
         self._fp8 = self._block_fp8 or self._pertensor_fp8
+        # compressed-tensors NVFP4 checkpoints that quantize the unfused in_proj parts keep
+        # qkv|z packed: the W4A16 GEMM replaces the bf16/dequant one. Its dequant math is
+        # identical to the load-time dequant (same fp4 * block * global product), so this is
+        # lossless -- it only keeps the packed tensors resident instead of a bf16 copy that
+        # alone would push a 27B model past a 24 GB card.
+        self._nvfp4_qkvz = attn_quant == "nvfp4" and in_proj_nvfp4
         # Modelopt NVFP4 checkpoints with the pre-fused split layout (Qwen3-Next) keep
         # in_proj_qkvz/in_proj_ba bf16: same two-GEMM path as fp8, but a bf16 qkvz GEMM.
-        self._split = self._fp8 or in_proj_split
+        self._split = self._fp8 or in_proj_split or self._nvfp4_qkvz
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
         if self._split:
             if self._fp8:
                 ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
                 self.in_proj_qkvz = ColMerged(
+                    hidden_size, [self.conv_dim, self.value_dim], has_bias=False
+                )
+            elif self._nvfp4_qkvz:
+                # packed qkv|z (W4A16): same [conv_dim, value_dim] output split and the same
+                # in_proj_qkvz.forward(hidden_states) call site below as the bf16/fp8 paths.
+                self.in_proj_qkvz = Nvfp4DenseColMerged(
                     hidden_size, [self.conv_dim, self.value_dim], has_bias=False
                 )
             else:
@@ -107,8 +125,9 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
         self.norm = _GatedRMSNorm(head_v_dim, eps=rms_norm_eps)
         # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
-        # NVFP4 (W4A16) / bf16. in_proj_* stay bf16 in every mode (above), so a compressed-tensors
-        # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.
+        # NVFP4 (W4A16) / bf16. in_proj_ba stays bf16 in every mode (above); a compressed-
+        # tensors NVFP4 checkpoint with packed in_proj parts (_nvfp4_qkvz) also makes qkvz
+        # and out_proj native FP4.
         self.out_proj = make_replicated_quant(
             expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
         )
@@ -152,6 +171,56 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
+    def spec_readvance(self, conv_in: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
+                       slot: int, device: torch.device,
+                       graph_consts: tuple | None = None) -> None:
+        """Spec partial-accept rollback: re-advance ONLY this layer's conv + recurrent
+        state over a row slice of the stashed spec-verify span. The slot must already
+        hold the pre-forward snapshot (``SpecLinearSnapshots.restore``); this re-runs
+        just the state-updating kernels (causal_conv1d_varlen + chunk scan) over the
+        caller's slice of the stash -- the verify forward's own (conv_in, a, b) -- so
+        the landed state is identical to the old full-model replay's, without the
+        ~100ms eager forward it used to cost. Output is discarded.
+
+        When ``graph_consts`` is given, the (cu_seqlens, cache_idx, has_init) device
+        tensors are passed in from the caller (graph-owned persistent buffers) instead
+        of being looked up from the ``_SPEC_READVANCE_CONSTS`` cache -- this avoids
+        H2D copies inside a CUDA graph capture region."""
+        pool = get_global_ctx().linear_state_pool
+        li = pool.local_index(self.layer_id)
+        rows = conv_in.shape[0]
+        if graph_consts is not None:
+            cu, idx, has_init = graph_consts
+        else:
+            # Const tensors (cu/idx/has_init) are cached device-side: three pageable H2D
+            # copies per layer per rollback (~90 under a busy engine stream) cost more
+            # than the kernels themselves. Keyed by (rows, slot, device) -- a handful of
+            # entries (rows <= 1+k, slots are per-request stable).
+            key = (rows, slot, device.index)
+            consts = _SPEC_READVANCE_CONSTS.get(key)
+            if consts is None:
+                consts = (
+                    torch.tensor([0, rows], dtype=torch.int64, device=device),  # ONE sequence
+                    torch.tensor([slot], dtype=torch.int32, device=device),
+                    torch.tensor([True], dtype=torch.bool, device=device),
+                )
+                _SPEC_READVANCE_CONSTS[key] = consts
+            cu, idx, has_init = consts
+        mixed = self._conv_prefill(conv_in, pool, cu, idx, has_init)
+        dtype = conv_in.dtype
+        qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = qf.reshape(1, rows, self.num_k_heads, self.head_k_dim).to(dtype)
+        k = kf.reshape(1, rows, self.num_k_heads, self.head_k_dim).to(dtype)
+        v = vf.reshape(1, rows, self.num_v_heads, self.head_v_dim).to(dtype)
+        g, beta = self._gate_params(a, b)
+        g = g.reshape(1, rows, self.num_v_heads)
+        beta = beta.float().reshape(1, rows, self.num_v_heads)
+        gdn_prefill_chunk_fla(
+            q, k, v, g, beta,
+            state_source=pool.recurrent_states[li], indices=idx,
+            cu_seqlens=cu, scale=self.head_k_dim ** -0.5,
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
@@ -178,6 +247,14 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             proj = self.in_proj.forward(hidden_states)
             conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
+        if batch.spec_verify:
+            # Partial-accept rollback input stash (Scheduler._replay_spec_states): the
+            # GDN state re-advance over the accepted span needs only these pre-conv
+            # projections, so keep them per layer -- the rollback then runs a few tiny
+            # state kernels instead of replaying a ~100ms full model forward.
+            if batch.spec_gdn_stash is None:
+                batch.spec_gdn_stash = {}
+            batch.spec_gdn_stash[self.layer_id] = (conv_in, a, b)
         li = pool.local_index(self.layer_id)
 
         if batch.is_decode:

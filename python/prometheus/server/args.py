@@ -109,6 +109,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _non_negative_int(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+        if n < 0:
+            raise argparse.ArgumentTypeError("must be >= 0")
+        return n
+
     def _infer_tool_call_parser(model_path: str) -> str:
         try:
             from prometheus.utils import cached_load_hf_config
@@ -343,6 +352,34 @@ def parse_args(
         type=int,
         default=ServerArgs.page_size,
         help="Set the page size for system management.",
+    )
+
+    parser.add_argument(
+        "--spec-ngram",
+        type=_non_negative_int,
+        default=ServerArgs.spec_ngram,
+        help=(
+            "n-gram speculative decoding draft length K (0 = off). With K > 0, greedy "
+            "requests draft up to K tokens from a prompt+output 3-gram index and "
+            "verify them in one forward, committing the longest matching prefix -- "
+            "output is identical to non-speculative greedy decoding. Automatically "
+            "disabled (with a warning) for models whose state cannot roll back "
+            "(GDN/linear attention) or when page_size != 1."
+        ),
+    )
+
+    parser.add_argument(
+        "--spec-mtp",
+        type=_non_negative_int,
+        default=ServerArgs.spec_mtp,
+        help=(
+            "MTP draft-head speculative decoding: number of draft tokens K (0 = off). "
+            "Uses the checkpoint's mtp.* layer (must be present; bf16, shared "
+            "embed/lm_head) to chain K draft tokens and verifies them with the same "
+            "greedy longest-prefix commit as --spec-ngram -- output is identical to "
+            "non-speculative greedy decoding. Mutually exclusive with --spec-ngram "
+            "(MTP wins) and ignored with a warning when page_size != 1."
+        ),
     )
 
     parser.add_argument(

@@ -58,6 +58,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "prometheus.models.qwen3_5_moe",
         "Qwen3_5MoEForCausalLM",
     ),
+    # Qwen4-exp (Qwen3.8-Flash-Next): multimodal wrapper served text-only; hybrid
+    # GDN/gated-full-attention backbone with hyper-connections, a host-resident PLE
+    # n-gram embedding and (milestone: dense) full attention on the full layers.
+    "Qwen4ExpForConditionalGeneration": ModelSpec(
+        "prometheus.models.qwen4_exp",
+        "Qwen4ExpForCausalLM",
+    ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the
     # loader handles the compressed-tensors NVFP4 layout.

@@ -28,7 +28,11 @@ class SamplingParams:
 
     @property
     def is_greedy(self) -> bool:
-        return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
+        # temperature <= 0 is argmax regardless of top_k/top_p (the temperature-0
+        # softmax collapses to a one-hot, so truncation filters nothing) -- real
+        # clients send `temperature: 0` alone and let server defaults fill top_p
+        # (e.g. 0.95), which must not disqualify greedy-only paths (spec decode).
+        return self.temperature <= 0.0 or (self.top_k == 1 and self.top_p == 1.0)
 
 
 @dataclass(eq=False)
@@ -113,6 +117,28 @@ class Req:
 class Batch:
     reqs: List[Req]
     phase: Literal["prefill", "decode"]
+    # n-gram speculative verification batch (see scheduler/spec.py): phase stays
+    # "prefill" so the batch rides the ragged/extend attention path and stays off
+    # the decode CUDA graph, while 1+k tokens per req are verified in one forward.
+    # Hot paths treat it as a plain bool check; False everywhere else.
+    spec_verify: bool = False
+    # Per-req draft token ids for a spec_verify batch (index i == reqs[i]); set by
+    # the scheduler at draft time, consumed by the drain-side verification.
+    spec_drafts: List[List[int]] | None = None
+    # MTP spec: drafts seated device-side. Each entry is (pinned int64 mirror,
+    # seated length), index i == reqs[i]; the drain materializes spec_drafts from
+    # the mirrors after copy_done (which orders the engine-stream forward after
+    # the scheduler-stream async D2H, so the copy is guaranteed landed).
+    spec_draft_deferred: list | None = None
+    # MTP draft head: stash the target's final hidden states (the tensor lm_head
+    # reads) on the batch so the scheduler-side drafter can consume them at drain
+    # time, outside the forward context. Prefill/spec batches only -- decode rides
+    # CUDA graphs, which cannot surface per-step hiddens.
+    return_hidden: bool = False
+    hidden_states: torch.Tensor | None = field(default=None, init=False)
+    # Per-padded-req row count of the forward (its extend_len at prepare time); with
+    # return_hidden, indexes each req's rows in the flat hidden_states tensor.
+    forward_row_lens: List[int] | None = None
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
@@ -125,6 +151,11 @@ class Batch:
     # flags), built once and shared by all GDN layers. Lazily built by the GDN op if
     # the scheduler/graph didn't set it.
     fla_metadata: "FLAMetadata | None" = field(default=None, init=False)
+    # Spec-verify GDN rollback stash (qwen3_5 GDN op): layer_id -> (conv_in, a, b),
+    # the verify span's pre-conv projections, written during the forward so a partial
+    # accept can re-advance the state over the accepted rows without replaying a full
+    # model forward (Scheduler._replay_spec_states). None on every other batch.
+    spec_gdn_stash: dict | None = field(default=None, init=False)
     padded_reqs: List[Req] = field(init=False)
     # DSV4 paged-KV out-locations for this batch (None for non-DSV4 models). Set by the scheduler.
     # This decode batch's padded per-row page-table rows. Attention backends that must read
@@ -170,6 +201,11 @@ class Context:
     # NOTE: this table always treat page_size = 1
     page_table: torch.Tensor = field(init=False)
     attn_backend: BaseAttnBackend = field(init=False)
+    # Speculative-decode verify backend (triton): the fi prefill wrapper plans
+    # host-side and cannot be captured, so spec-verify batches route here to keep
+    # the fixed-shape verify forward CUDA-graphable (Engine --spec-mtp). None when
+    # MTP spec is off -- every other forward is byte-identical either way.
+    spec_attn_backend: BaseAttnBackend | None = None
     moe_backend: BaseMoeBackend = field(init=False)
     moe_offload_cache: OffloadMoeCache | None = None
     kv_cache: BaseKVCachePool = field(init=False)

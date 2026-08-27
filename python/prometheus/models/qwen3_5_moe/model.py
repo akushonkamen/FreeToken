@@ -45,6 +45,7 @@ class Qwen3_5DecoderLayer(BaseOP):
                 expert_quant=config.expert_quant,
                 attn_quant=config.attn_quant,
                 in_proj_split=g.in_proj_split,
+                in_proj_nvfp4=g.in_proj_nvfp4,
             )
         else:
             self.self_attn = Qwen3_5Attention(config, layer_id)
@@ -88,9 +89,30 @@ class Qwen3_5Model(BaseOP):
         x, _ = self.norm.forward_add_residual(x, residual)
         return x
 
+    def readvance_gdn_states(self, stash: dict, start: int, rows: int, slot: int,
+                             device: torch.device,
+                             graph_consts: tuple | None = None) -> None:
+        """Spec partial-accept rollback: re-advance every GDN layer's conv + recurrent
+        state over rows [start, start+rows) of the stashed spec-verify span
+        (Scheduler._replay_spec_states). Attention layers need no state rollback -- their
+        KV for the accepted rows was already written correctly by the verify forward.
+
+        ``graph_consts`` is forwarded to each layer's ``spec_readvance``: when not None
+        it carries the (cu, idx, has_init) persistent buffers owned by the rechain CUDA
+        graph, so the replay path avoids H2D copies inside the capture region."""
+        for layer in self.layers.op_list:
+            if layer._is_linear:
+                conv_in, a, b = stash[layer.linear_attn.layer_id]
+                layer.linear_attn.spec_readvance(
+                    conv_in[start : start + rows], a[start : start + rows],
+                    b[start : start + rows], slot, device,
+                    graph_consts=graph_consts,
+                )
+
 
 class Qwen3_5MoEForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
+        self._config = config  # underscore attr: kept out of state_dict
         self.model = Qwen3_5Model(config)
         if getattr(config, "lm_head_quant", "none") == "nvfp4":
             # checkpoint stores the (untied) lm_head as NVFP4: keep it native (W4A16) -- the
@@ -112,7 +134,43 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
+        batch = get_global_ctx().batch
+        if batch.return_hidden:
+            # MTP spec path: the scheduler-side drafter consumes the target's final
+            # hidden states (this tensor) at drain time, outside the forward ctx.
+            batch.hidden_states = output
         return self.lm_head.forward(output)
+
+    def readvance_gdn_states(self, stash: dict, start: int, rows: int, slot: int,
+                             device: torch.device,
+                             graph_consts: tuple | None = None) -> None:
+        """Delegate to the backbone (spec partial-accept rollback entry point for the
+        scheduler; see Qwen3_5Model.readvance_gdn_states)."""
+        return self.model.readvance_gdn_states(
+            stash, start, rows, slot, device, graph_consts=graph_consts,
+        )
+
+    def build_mtp_draft(self, model_path: str, device: torch.device):
+        """Build the MTP draft head from the checkpoint's bf16 mtp.* tensors, sharing
+        this model's embed_tokens and lm_head by reference. Raises when the checkpoint
+        carries no MTP head or the lm_head is not a plain bf16 head."""
+        from prometheus.layers import ParallelLMHead
+
+        from .mtp import MTPDraft, load_mtp_state_dict
+
+        assert isinstance(self.lm_head, ParallelLMHead), (
+            "--spec-mtp requires the plain bf16 lm_head (untied, unquantized)"
+        )
+        state = load_mtp_state_dict(model_path, device)
+        if state is None:
+            raise ValueError(f"--spec-mtp: no MTP draft head (mtp.*) in {model_path}")
+        from prometheus.utils import torch_dtype
+
+        with torch.device(device), torch_dtype(torch.bfloat16):
+            draft = MTPDraft(self._config, self.model.embed_tokens, self.lm_head)
+        draft.load_state_dict(state)
+        draft.quantize_linears_nvfp4()
+        return draft
 
 
 __all__ = ["Qwen3_5MoEForCausalLM"]

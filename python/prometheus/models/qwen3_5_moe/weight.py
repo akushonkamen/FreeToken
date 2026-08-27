@@ -306,11 +306,17 @@ def _iter_weights_flat(
     # in_proj -- they take the pure-NVFP4 path below.
     if _compressed_tensors_nvfp4(hf_config) and _is_ct_storage(model_path):
         # Dense compressed-tensors NVFP4 (e.g. Qwen3.6-27B): attn (q/k/v/o, GDN out_proj) +
-        # dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms bf16.
+        # dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms bf16 -- unless the
+        # checkpoint packs the GDN in_proj parts too, then those stay native as well.
+        try:
+            gdn_group = config.linear_attention_group()
+        except Exception:
+            gdn_group = None
         yield from _iter_weights_compressed_tensors(
             model_path, device,
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
             nvfp4=config.dense_quant == "nvfp4",
+            in_proj_packed=bool(gdn_group is not None and gdn_group.in_proj_nvfp4),
         )
         return
     if config.expert_quant == "fp8_block":
@@ -692,6 +698,20 @@ _CT_BF16_FUSE: dict[str, tuple[str, ...]] = {
         ".linear_attn.in_proj_b", ".linear_attn.in_proj_a",
     ),
 }
+# Checkpoints that pack the unfused GDN in_proj parts as NVFP4 (``in_proj_qkv.weight_packed``,
+# e.g. Qwen3.8-27B-MTP-NVFP4) serve qkv|z through the native W4A16 ``in_proj_qkvz``: keep the
+# packed tensors and fuse on the output dim (each part keeps its own block/global scales, so
+# the fused FP4 weight is exact) instead of dequantizing to bf16 at load. b|a fuse into the
+# bf16 ``in_proj_ba`` as usual -- 2*num_v_heads output rows each, negligible either way, and
+# the model keeps them bf16 by contract. The bf16 table also covers the mixed case of a part
+# arriving as plain ``.weight`` under the same split layout.
+_CT_GDN_NVFP4_FUSE: dict[str, tuple[str, ...]] = {
+    ".linear_attn.in_proj_qkvz": (".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z"),
+}
+_CT_GDN_SPLIT_BF16_FUSE: dict[str, tuple[str, ...]] = {
+    ".linear_attn.in_proj_qkvz": (".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z"),
+    ".linear_attn.in_proj_ba": (".linear_attn.in_proj_b", ".linear_attn.in_proj_a"),
+}
 # The scale suffixes and parts/fuse machinery are shared with muse_glimmer and live
 # in models/loader.py.
 _CT_SCALE_SUFFIXES = CT_SCALE_SUFFIXES
@@ -705,14 +725,17 @@ def _ct_nvfp4_fuse(base: str, parts_tuple: tuple, buf: dict):
 
 def _iter_weights_compressed_tensors(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool,
-    nvfp4: bool,
+    nvfp4: bool, in_proj_packed: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Dense pass for a compressed-tensors NVFP4 checkpoint (e.g. Qwen3.6-27B).
 
     Keeps the NVFP4 attention (q/k/v/o, GDN out_proj) and dense MLP (gate/up/down) native
     (W4A16) -- ``.weight`` (uint8) + ``.weight_scale`` (fp8 block) + ``.weight_global`` (fp16
     per-row) -- when ``nvfp4``; otherwise dequantizes each to bf16. q/k/v -> ``qkv_proj``, dense gate/up -> ``gate_up_proj`` (output-dim concat).
-    GDN ``in_proj_{qkv,z,b,a}`` stay bf16 -> fused ``in_proj``; ``conv1d``/``A_log``/``dt_bias``/
+    GDN ``in_proj_{qkv,z,b,a}`` stay bf16 -> fused ``in_proj``; with ``in_proj_packed``
+    (parts stored as ``weight_packed``) they instead fuse into the split two-GEMM layout:
+    qkv|z stay packed (native W4A16 ``in_proj_qkvz``), b|a dequantize to bf16
+    (``in_proj_ba``). ``conv1d``/``A_log``/``dt_bias``/
     gated ``norm`` pass through (fp32 for A_log/dt_bias). Gemma (1+w) norms get +1. lm_head and
     embeddings are bf16. The model is dense (no routed experts), so there is no experts pass."""
     if get_tp_info().size > 1:
@@ -727,7 +750,10 @@ def _iter_weights_compressed_tensors(
     def _emit_bf16_weight(name: str, tensor: torch.Tensor):
         """Plain bf16 ``.weight``: GDN in_proj fusion, Gemma (1+w) norms, else passthrough."""
         base = name[: -len(".weight")]
-        emit = _ct_bf16_fuse(base, tensor, bf16_buf, _CT_BF16_FUSE)
+        # Under the packed-in_proj layout the model serves the split two-GEMM path even
+        # when a GDN part itself arrives bf16: fuse qkv|z -> in_proj_qkvz, b|a -> in_proj_ba.
+        fuse = _CT_GDN_SPLIT_BF16_FUSE if in_proj_packed else _CT_BF16_FUSE
+        emit = _ct_bf16_fuse(base, tensor, bf16_buf, fuse)
         if emit is not None:
             yield from emit
             return
@@ -759,6 +785,22 @@ def _iter_weights_compressed_tensors(
                     base = name[: -len(".weight_packed")]
                     raw_base = raw_name[: -len(".weight_packed")]
                     w, s, g = _nvfp4_parts_ct(reader, raw_base)
+                    if in_proj_packed and any(
+                        base.endswith(p) for ps in _CT_GDN_NVFP4_FUSE.values() for p in ps
+                    ):
+                        # GDN qkv|z: keep packed and fuse -> the native W4A16 ``in_proj_qkvz``
+                        # (output-dim concat; each part keeps its own block/global scales).
+                        yield from ct_nvfp4_fuse(base, (w, s, g), nvfp4_buf, _CT_GDN_NVFP4_FUSE)
+                        continue
+                    if in_proj_packed and any(
+                        base.endswith(p) for ps in _CT_GDN_SPLIT_BF16_FUSE.values() for p in ps
+                    ):
+                        # GDN b|a are packed too but stay bf16 by the model contract: dequant
+                        # (the global scale is per-row already; pass one element as the scalar)
+                        # and fuse -> the bf16 ``in_proj_ba``.
+                        bf16 = _dequant_nvfp4_weight(w, s, g[:1])
+                        yield from _ct_bf16_fuse(base, bf16, bf16_buf, _CT_GDN_SPLIT_BF16_FUSE)
+                        continue
                     # GDN in_proj_* compute in bf16 (model contract) but some checkpoints
                     # (e.g. sakamakismile/Qwen3.6-27B-NVFP4) quantize them too: dequant to
                     # bf16 here and let the bf16 fusion assemble ``in_proj`` as usual.

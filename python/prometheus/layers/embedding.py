@@ -104,10 +104,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
-        if batch.is_prefill:
+        if batch.is_prefill and not batch.spec_verify:
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()
             del indices
+        # spec_verify: keep EVERY extend position's logits -- the scheduler argmaxes
+        # each draft position to verify it, so the last-position gather must not run.
 
         module = self.tied_embedding or self
         logits = F.linear(x, module.weight, self.bias)
@@ -116,7 +118,9 @@ class ParallelLMHead(VocabParallelEmbedding):
         input_shape = logits.shape
         output_tensor = self._comm.all_gather(logits)
 
-        if bs == 1:
+        if bs == 1 and not batch.spec_verify:
+            # spec_verify keeps >1 rows even at bs==1 (1+k positions); take the
+            # general reshape below so the vocab shards split per row.
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
 
         output_tensor = output_tensor.view((self.tp_size,) + input_shape)
