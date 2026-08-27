@@ -146,21 +146,22 @@ class Qwen4PleEmbedding(BaseOP):
         assert shards, f"no ngram_embedding shards under {path}"
         import safetensors
 
-        parts = []
+        padded = self.padded_vocab()
+        # Allocate the pinned destination first and stream each shard straight into
+        # its slice -- holding all 128 parts at once would double the ~102 GB peak.
+        table = torch.empty(padded, self._head_dim, dtype=torch.bfloat16, pin_memory=True)
+        off = 0
         for idx in sorted(shards):
             file, key = shards[idx]
             with safetensors.safe_open(file, framework="pt", device="cpu") as f:
-                parts.append(f.get_tensor(key))
-        rows = sum(t.shape[0] for t in parts)
-        padded = self.padded_vocab()
-        assert rows == padded, f"ngram shards hold {rows} rows, buffers say {padded}"
-        table = torch.empty(padded, self._head_dim, dtype=torch.bfloat16, pin_memory=True)
-        off = 0
-        for t in parts:
+                t = f.get_tensor(key)
             assert t.shape[1] == self._head_dim, f"shard shape {t.shape} != {-1, self._head_dim}"
-            table[off : off + t.shape[0]].copy_(t)
-            off += t.shape[0]
-        del parts
+            end = off + t.shape[0]
+            assert end <= padded, f"shard {idx} overruns the padded table ({end} > {padded})"
+            table[off:end].copy_(t)
+            off = end
+            del t
+        assert off == padded, f"ngram shards hold {off} rows, buffers say {padded}"
         self._table = table
         self._gpu = {
             "mult": self._layer_multipliers.to(device),
