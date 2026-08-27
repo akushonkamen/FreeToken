@@ -91,8 +91,12 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
-        read_ids: List[List[int]] = []
-        surr_ids: List[List[int]] = []
+        # Spec-verify steps ship several DetokenizeMsgs for the same uid in one
+        # batch (one per committed token). The offsets must therefore be read
+        # per message after each append -- computing all read/surr slices up
+        # front (as one batch) re-decodes tokens already consumed by an earlier
+        # msg of the same uid and emits cumulative instead of incremental text.
+        incremental_strs: List[str] = []
         for msg in msgs:
             if msg.uid not in self.decode_map:
                 self.decode_map[msg.uid] = DecodeStatus(
@@ -105,15 +109,12 @@ class DetokenizeManager:
             s = self.decode_map[msg.uid]
             if not (msg.finished and msg.next_token in self.eos_token_ids):
                 s.decoded_ids.append(msg.next_token)
-            read_ids.append(s.decoded_ids[s.surr_offset :])
-            surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])
-
-        read_texts = self.tokenizer.batch_decode(read_ids)
-        surr_texts = self.tokenizer.batch_decode(surr_ids)
-
-        incremental_strs: List[str] = []
-        for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
-            s = self.decode_map[msg.uid]
+            read_str = self.tokenizer.decode(s.decoded_ids[s.surr_offset :])
+            surr_str = (
+                self.tokenizer.decode(s.decoded_ids[s.surr_offset : s.read_offset])
+                if s.read_offset > s.surr_offset
+                else ""
+            )
             new_text = read_str[len(surr_str) :]
             # Streaming chunk: update the decode status
             if len(new_text) > 0 and not new_text.endswith("�"):
