@@ -474,6 +474,13 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
             batch = get_global_ctx().batch
             return torch.zeros(batch.size, 3)
 
+        # BaseLLMModel contract (upstream f339b0a): graph capture/replay hooks.
+        def prepare_cuda_graph_capture(self, batch):
+            pass
+
+        def prepare_cuda_graph_replay(self, batch):
+            pass
+
     class FakeOffloadCache:
         def reset(self):
             events.append("reset")
