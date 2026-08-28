@@ -139,10 +139,18 @@ class Qwen4PleEmbedding(BaseOP):
             r"^(.*)\.ple\.ple_embedding\.ngram_embedding\.shard_(\d+)\.weight$"
         )
         shards: dict[int, tuple[str, str]] = {}
+        scale_file = scale_key = None
+        scale_re = re.compile(
+            r"^(.*)\.ple\.ple_embedding\.ngram_embedding\.weight_scale$"
+        )
         for key, fname in index["weight_map"].items():
             m = shard_re.match(key)
             if m:
                 shards[int(m.group(2))] = (os.path.join(path, fname), key)
+                continue
+            ms = scale_re.match(key)
+            if ms:  # FP8-PLE table: per-table scalar scale alongside the shards
+                scale_file, scale_key = os.path.join(path, fname), key
         assert shards, f"no ngram_embedding shards under {path}"
         import safetensors
 
@@ -150,11 +158,21 @@ class Qwen4PleEmbedding(BaseOP):
         # Allocate the pinned destination first and stream each shard straight into
         # its slice -- holding all 128 parts at once would double the ~102 GB peak.
         table = torch.empty(padded, self._head_dim, dtype=torch.bfloat16, pin_memory=True)
+        fp8_scale = None
         off = 0
         for idx in sorted(shards):
             file, key = shards[idx]
             with safetensors.safe_open(file, framework="pt", device="cpu") as f:
                 t = f.get_tensor(key)
+            if t.dtype != torch.bfloat16:  # FP8-PLE shard (float8_e4m3fn + scalar scale)
+                if scale_key is None:
+                    raise ValueError(
+                        f"FP8 ngram shard {idx} but no ngram_embedding.weight_scale in index"
+                    )
+                if fp8_scale is None:
+                    with safetensors.safe_open(scale_file, framework="pt", device="cpu") as sf:
+                        fp8_scale = sf.get_tensor(scale_key).to(torch.bfloat16)
+                t = t.to(torch.bfloat16) * fp8_scale
             assert t.shape[1] == self._head_dim, f"shard shape {t.shape} != {-1, self._head_dim}"
             end = off + t.shape[0]
             assert end <= padded, f"shard {idx} overruns the padded table ({end} > {padded})"

@@ -8,6 +8,7 @@ from prometheus.models.config import (
     LinearGatedDeltaGroupConfig,
     ModelConfig,
     RotaryConfig,
+    detect_expert_quant,
 )
 
 
@@ -64,15 +65,23 @@ def _layer_types(text: Any) -> list[str]:
 def parse_config(hf_config: Any, model_path: str | None = None) -> ModelConfig:
     """Qwen4ExpForConditionalGeneration (text tower) -> ModelConfig.
 
-    bf16-only milestone: any quantization_config is rejected loudly. The multimodal
+    bf16 + modelopt NVFP4 (routed-experts-only) checkpoints: any other
+    quantization_config is rejected loudly. The multimodal
     wrapper's ``model.visual.*`` tower is dropped by the weight loader; the text
     tower is served text-only, exactly like the qwen3_5_moe conditional-generation
     checkpoints before it.
     """
     text = getattr(hf_config, "text_config", hf_config)
 
-    if getattr(hf_config, "quantization_config", None):
-        raise ValueError("qwen4_exp weight loading supports the bf16 checkpoint only")
+    # modelopt NVFP4 (routed-experts-only, e.g. RadixArk Flash-Next-NVFP4) is served
+    # with the experts in native FP4 offload banks; every dense tensor stays bf16, so the
+    # dense pass below is unchanged and only expert_quant flips to "nvfp4".
+    expert_quant = detect_expert_quant(hf_config)
+    if getattr(hf_config, "quantization_config", None) and expert_quant != "nvfp4":
+        raise ValueError(
+            "qwen4_exp weight loading supports bf16 or modelopt NVFP4 checkpoints only "
+            f"(got expert quant {expert_quant!r})"
+        )
 
     head_dim = (
         getattr(text, "head_dim", None)
@@ -181,6 +190,7 @@ def parse_config(hf_config: Any, model_path: str | None = None) -> ModelConfig:
         norm_topk_prob=bool(getattr(text, "norm_topk_prob", True)),
         moe_scoring_func=str(getattr(text, "scoring_func", None) or "softmax"),
         moe_enabled=True,
+        expert_quant=expert_quant,
         use_qk_norm=True,
         model_type="qwen4_exp",
         architectures=getattr(hf_config, "architectures", ["Qwen4ExpForConditionalGeneration"]),

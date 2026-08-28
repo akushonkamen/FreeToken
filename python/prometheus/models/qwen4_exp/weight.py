@@ -6,7 +6,11 @@ from typing import Iterator
 import safetensors
 import torch
 from prometheus.distributed import get_tp_info
-from prometheus.models.loader import iter_weight_files
+from prometheus.models.loader import drop_page_cache, iter_weight_files
+from prometheus.models.nvfp4_banks import (
+    Nvfp4ExpertSourceSpec,
+    load_nvfp4_expert_source_banks,
+)
 from prometheus.utils import cached_load_hf_config
 from tqdm import tqdm
 
@@ -43,6 +47,23 @@ _INDEXER_RE = re.compile(r"\.self_attn\.indexer\.")
 # (gate_up [E, 2I, H] gate-first, down [E, H, I]) -- pass through minus the suffix.
 _STACKED_EXPERT_RE = re.compile(
     r"^model\.layers\.\d+\.mlp\.experts\.(gate_up_proj|down_proj)\.weight$"
+)
+
+# NVFP4 routed experts (modelopt checkpoint, e.g. RadixArk Flash-Next-NVFP4): per-expert,
+# un-fused, under the raw ``model[.language_model].layers.N.mlp.experts.E.{proj}`` key --
+# matched against the RAW weight_map key by the bank loader. The dense pass drops these
+# tensors (and their modelopt scales); the pre-stacked bf16 layout above has no
+# ``.mlp.experts.<int>.`` segment, so it is unaffected.
+_NVFP4_EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
+_NVFP4_EXPERT_KEY_RE = re.compile(
+    r"^model\.(?:language_model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
+)
+_NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=_NVFP4_EXPERT_KEY_RE,
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: layer,  # every Flash-Next layer is MoE
+    desc="Qwen3.8-Flash-Next NVFP4 experts",
 )
 
 # Gemma-style (1+weight) norms of the REUSED qwen3_5 modules (the loader bakes +1;
@@ -99,9 +120,18 @@ def iter_weights(
         disable=not get_tp_info().is_primary(),
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            keyset = set(f.keys())
             for raw_name in f.keys():
+                # Per-expert NVFP4 tensors (packed weights + modelopt scales) go to the
+                # offload banks (load_nvfp4_expert_source_banks), never this dense pass.
+                # A plain bf16 per-expert ``.weight`` (no scale sibling) falls through.
+                if _NVFP4_EXPERT_RE.search(raw_name) and (
+                    not raw_name.endswith(".weight")
+                    or raw_name.removesuffix(".weight") + ".weight_scale" in keyset
+                ):
+                    continue
                 if raw_name.endswith(_SCALE_SUFFIXES):
-                    continue  # no quant scales in the bf16 checkpoint; guard anyway
+                    continue  # standalone modelopt scales are consumed with their .weight
                 if (
                     _NGRAM_SHARD_RE.search(raw_name)
                     or _INDEXER_RE.search(raw_name)
@@ -163,4 +193,37 @@ def iter_weights(
     assert not layers, f"Incomplete per-expert layers: {layers}"
 
 
-__all__ = ["iter_weights"]
+def load_nvfp4_expert_sources(
+    model_path: str, config, *, layer_sink=None
+) -> dict[str, list[torch.Tensor]]:
+    """CPU NVFP4 expert source banks for the offload cache; see
+    ``prometheus.models.nvfp4_banks.load_nvfp4_expert_source_banks``."""
+    return load_nvfp4_expert_source_banks(
+        model_path,
+        config,
+        _NVFP4_SOURCE_SPEC,
+        drop_page_cache=drop_page_cache,
+        primary=get_tp_info().is_primary(),
+        layer_sink=layer_sink,
+    )
+
+
+def load_nvfp4_expert_sources_parallel(
+    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
+):
+    """parallel: same NVFP4 source banks via the common chunked multi-threaded O_DIRECT reader."""
+    from prometheus.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
+
+    return load_nvfp4_expert_source_banks_parallel(
+        model_path,
+        config,
+        _NVFP4_SOURCE_SPEC,
+        drop_page_cache=drop_page_cache,
+        primary=get_tp_info().is_primary(),
+        workers=workers,
+        chunk=chunk,
+        layer_sink=layer_sink,
+    )
+
+
+__all__ = ["iter_weights", "load_nvfp4_expert_sources", "load_nvfp4_expert_sources_parallel"]
