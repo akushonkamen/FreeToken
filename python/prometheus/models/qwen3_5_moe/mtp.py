@@ -187,6 +187,46 @@ class MTPAttention(BaseOP):
         gated = out * torch.sigmoid(gate)
         return self.o_proj.forward(gated)
 
+    def forward_rows(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        kv_list: List[Tuple[torch.Tensor, torch.Tensor, int]],
+    ) -> torch.Tensor:
+        """Cross-request batched step: row b is ONE token of request b, written to and
+        attending over ITS OWN cache (kv_list[b] = (k_cache, v_cache, kv_start)). The
+        projections (the weight traffic) run once for the whole batch; only the tiny
+        per-request SDPA over private rows loops. L == 1 per request, so no causal
+        mask is needed: the [0, kv_start] prefix is fully visible and the written row
+        attends to itself."""
+        B = x.shape[0]
+        qkv = self.qkv_proj.forward(x)
+        qg, k, v = torch.split(qkv, self._qkv_split, dim=-1)
+        qg = qg.view(B, self.num_q, self.head_dim * 2)
+        q = qg[..., : self.head_dim].reshape(B, self.qo_attn_dim).contiguous()
+        gate = qg[..., self.head_dim :].reshape(B, self.qo_attn_dim)
+        k = k.view(B, self.num_kv, self.head_dim).contiguous()
+        v = v.contiguous()
+        q = self.q_norm.forward(q.view(B, self.num_q, self.head_dim)).reshape(B, self.qo_attn_dim)
+        k = self.k_norm.forward(k)
+        q, k = self.rotary.forward(positions, q, k)
+        outs = []
+        for b, (k_cache, v_cache, kv_start) in enumerate(kv_list):
+            k_cache[kv_start] = k[b].reshape(-1)
+            v_cache[kv_start] = v[b]
+            qb = q[b].view(1, self.num_q, 1, self.head_dim)
+            T = kv_start + 1
+            kb = k_cache[:T].view(T, self.num_kv, self.head_dim).transpose(0, 1).unsqueeze(0)
+            vb = v_cache[:T].view(T, self.num_kv, self.head_dim).transpose(0, 1).unsqueeze(0)
+            outs.append(
+                F.scaled_dot_product_attention(qb, kb, vb, enable_gqa=True)[0, :, 0].reshape(
+                    self.qo_attn_dim
+                )
+            )
+        out = torch.stack(outs, dim=0)
+        gated = out * torch.sigmoid(gate)
+        return self.o_proj.forward(gated)
+
 
 class MTPMLP(BaseOP):
     """Plain SwiGLU MLP with the checkpoint's fused-projection attribute names
@@ -224,6 +264,21 @@ class MTPDecoderLayer(BaseOP):
         residual = hidden
         hidden = self.input_layernorm.forward(hidden)
         hidden = self.self_attn.forward(hidden, positions, k_cache, v_cache, kv_start)
+        hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
+        hidden = self.mlp.forward(hidden)
+        return hidden, residual
+
+    def forward_rows(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        kv_list: List[Tuple[torch.Tensor, torch.Tensor, int]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Cross-request batched variant of forward: one row per request, each pair
+        with its own KV cache slice (see MTPAttention.forward_rows)."""
+        residual = hidden
+        hidden = self.input_layernorm.forward(hidden)
+        hidden = self.self_attn.forward_rows(hidden, positions, kv_list)
         hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
         hidden = self.mlp.forward(hidden)
         return hidden, residual
@@ -287,6 +342,27 @@ class MTPDraft(BaseOP):
         z, _ = self.norm.forward_add_residual(h, residual)
         return z
 
+    def forward_tokens_multi(
+        self,
+        tokens: torch.Tensor,
+        hiddens: torch.Tensor,
+        positions: torch.Tensor,
+        kv_list: List[Tuple[torch.Tensor, torch.Tensor, int]],
+    ) -> torch.Tensor:
+        """Cross-request batched forward_tokens: row b is one (token, hidden) pair of
+        request b, landing at that request's KV row kv_list[b][2] / position
+        positions[b]. Returns z [B, hidden] (row b predicts request b's next
+        position). The GEMMs (the weight traffic) run once for the whole batch."""
+        e = self._embed_tokens.forward(tokens)
+        h = torch.cat(
+            (self.pre_fc_norm_embedding.forward(e), self.pre_fc_norm_hidden.forward(hiddens)),
+            dim=-1,
+        )
+        h = self.fc.forward(h)
+        h, residual = self.layers.op_list[0].forward_rows(h, positions, kv_list)
+        z, _ = self.norm.forward_add_residual(h, residual)
+        return z
+
     def quantize_linears_nvfp4(self) -> None:
         """Swap the head's bf16 linears for NVFP4 (W4A16) shims (draft-side only:
         a worse z just lowers acceptance, the verify still commits the target's own
@@ -303,6 +379,15 @@ class MTPDraft(BaseOP):
     def argmax_next(self, z: torch.Tensor) -> torch.Tensor:
         """Greedy next token of the draft head: [1, hidden] -> [1] int64 on device,
         through the draft-side NVFP4 lm_head copy (4x less weight traffic than bf16)."""
+        return torch.argmax(
+            nvfp4_dense_linear_t(z, self._lmq_packed, self._lmq_scale, self._lmq_global),
+            dim=-1,
+        )
+
+    def argmax_next_multi(self, z: torch.Tensor) -> torch.Tensor:
+        """Batched argmax_next: [B, hidden] -> [B] int64. One sweep of the NVFP4
+        lm_head for the whole batch instead of one per request (the lm_head read
+        dominates draft-side weight traffic)."""
         return torch.argmax(
             nvfp4_dense_linear_t(z, self._lmq_packed, self._lmq_scale, self._lmq_global),
             dim=-1,
@@ -406,6 +491,12 @@ class MTPDraftManager:
         # Requests that can never spec (non-greedy / multimodal: no lossless greedy
         # verification exists for them; a prefix-cache hit is NOT here -- it bridges).
         self._ineligible: Set[int] = set()
+        # (uid, hard_cap) pairs whose rechain the drain hooks deferred (rechain=False)
+        # so the whole drained batch rechains in ONE batched sweep per chain step
+        # (flush_rechain). Must be flushed before the next seat_drafts: a pending
+        # state has no fresh draft_t, and seat_drafts would fall the batch back to
+        # a plain decode.
+        self._rechain_pending: List[Tuple[int, int]] = []
 
     def remove(self, uid: int) -> None:
         self.states.pop(uid, None)
@@ -465,7 +556,9 @@ class MTPDraftManager:
 
     # ---------------- drain-side hooks (scheduler) ----------------
 
-    def on_prefill_hidden(self, req: "Req", hidden_rows: torch.Tensor, final: bool) -> None:
+    def on_prefill_hidden(
+        self, req: "Req", hidden_rows: torch.Tensor, final: bool, rechain: bool = True
+    ) -> None:
         """Advance the draft over one prefill chunk: row r of the chunk pairs token
         x_{first_row + r + 1} with hidden row r (token t pairs the hidden of the token
         BEFORE it). Tokens come from req.input_ids, which spans the whole prompt plus
@@ -529,9 +622,14 @@ class MTPDraftManager:
         self._ensure_cap(state, need, req.max_device_len)
         self._run_pairs(state, tokens, hidden_rows)
         if final:
-            self._rechain(state, req.max_device_len)
+            if rechain:
+                self._rechain(state, req.max_device_len)
+            else:
+                self._rechain_pending.append((req.uid, req.max_device_len))
 
-    def on_decode_committed(self, req: "Req", token: int, finished: bool) -> None:
+    def on_decode_committed(
+        self, req: "Req", token: int, finished: bool, rechain: bool = True
+    ) -> None:
         """A plain decode step committed ``token`` (the CUDA-graph step cannot expose
         its target hidden, so pairs bridge with the draft's own z). Only runs when
         spec seating fell back to plain decode for the batch."""
@@ -567,7 +665,10 @@ class MTPDraftManager:
         tokens = torch.tensor([token], dtype=torch.int32)
         self._ensure_cap(state, state.valid_len + 1 + self.num_draft - 1, req.max_device_len)
         self._run_pairs(state, tokens, state.z)
-        self._rechain(state, req.max_device_len)
+        if rechain:
+            self._rechain(state, req.max_device_len)
+        else:
+            self._rechain_pending.append((req.uid, req.max_device_len))
         state.hist.append(("decode-subst", state.valid_len, req.cached_len, state.draft_n))
         state.hist = state.hist[-12:]
         _trace(f"decode-subst uid={req.uid} valid_len={state.valid_len} cached_len={req.cached_len}")
@@ -580,6 +681,7 @@ class MTPDraftManager:
         preds: List[int],
         draft: List[int],
         finished: bool,
+        rechain: bool = True,
     ) -> None:
         """Post-verify advance: keep the chain rows of the accepted prefix
         (== min(accepted, len(draft)-1) rows, built on exactly those draft tokens),
@@ -632,7 +734,75 @@ class MTPDraftManager:
             # prefix bridge uses, just chained. Keeps valid_len exact; drafts stay
             # candidates, so the committed stream is untouched.
             self._rollout_z(state, tokens)
-        self._rechain(state, req.max_device_len)
+        if rechain:
+            self._rechain(state, req.max_device_len)
+        else:
+            self._rechain_pending.append((req.uid, req.max_device_len))
+
+    def flush_rechain(self) -> None:
+        """Rechained every state deferred by the drain hooks in one lockstep sweep:
+        per chain step ONE batched draft forward + ONE batched lm_head argmax for all
+        requests, instead of a full weight sweep per request per step (the dominant
+        draft cost at C>=2: B x (K-1) single-token sweeps -> K-1 B-token sweeps).
+        Must run before the next seat_drafts (a pending state has no fresh chain)."""
+        if not self._rechain_pending:
+            return
+        entries, self._rechain_pending = self._rechain_pending, []
+        states: List[_MTPReqState] = []
+        caps: List[int] = []
+        for uid, hard_cap in entries:
+            state = self.states.get(uid)
+            # A same-drain remove() (request finished between defer and flush) or a
+            # DROP can retire a uid before the flush; skip it.
+            if state is None or state.z is None:
+                continue
+            states.append(state)
+            caps.append(hard_cap)
+        if not states:
+            return
+        if len(states) == 1:
+            # Identical to the deferred per-request rechain; skip the batching glue.
+            self._rechain(states[0], caps[0])
+            return
+        budgets = [
+            min(self.num_draft, max(1, cap - s.valid_len)) for s, cap in zip(states, caps)
+        ]
+        for s, cap, k in zip(states, caps, budgets):
+            self._ensure_cap(s, s.valid_len + k, cap)
+        B = len(states)
+        cur_z = [s.z for s in states]  # [1, hidden] each; updated per step
+        seeds = self.draft.argmax_next_multi(torch.cat(cur_z, dim=0))  # [B] int64
+        # Per-state device-token lists (built device-side; one host sync avoided --
+        # the chains never leave the GPU until seat_drafts' pinned mirror).
+        draft_lists: List[List[torch.Tensor]] = [[seeds[b : b + 1]] for b in range(B)]
+        chain_lists: List[List[torch.Tensor]] = [[] for _ in range(B)]
+        for i in range(max(budgets) - 1):
+            idx = [b for b in range(B) if i < budgets[b] - 1]
+            if not idx:
+                break
+            toks = torch.cat(
+                [draft_lists[b][-1] for b in idx]
+            ).to(torch.int32)
+            hiddens = torch.cat([cur_z[b] for b in idx], dim=0)
+            positions = torch.tensor(
+                [states[b].valid_len + i + 1 for b in idx],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_list = [
+                (states[b].k_cache, states[b].v_cache, states[b].valid_len + i)
+                for b in idx
+            ]
+            z_new = self.draft.forward_tokens_multi(toks, hiddens, positions, kv_list)
+            nxt = self.draft.argmax_next_multi(z_new)
+            for j, b in enumerate(idx):
+                draft_lists[b].append(nxt[j : j + 1])
+                chain_lists[b].append(z_new[j : j + 1])
+                cur_z[b] = z_new[j : j + 1]
+        for state, toks, zs in zip(states, draft_lists, chain_lists):
+            state.draft_t = torch.cat(toks)
+            state.draft_n = state.draft_t.shape[0]
+            state.chain_z = zs
 
     # ---------------- GPU plumbing ----------------
 

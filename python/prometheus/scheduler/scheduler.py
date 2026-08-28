@@ -441,7 +441,13 @@ class Scheduler(SchedulerIOMixin):
                     # verify asserts. hidden=None (batch without stashed target
                     # hiddens) takes the drafter's z-substitution rollout instead.
                     self.mtp_manager.on_spec_accept(
-                        req, spec_m, spec_hidden, preds, batch.spec_drafts[i], spec_finished
+                        req,
+                        spec_m,
+                        spec_hidden,
+                        preds,
+                        batch.spec_drafts[i],
+                        spec_finished,
+                        rechain=False,
                     )
                     if spec_replay is not None:
                         spec_replays.append(spec_replay)
@@ -509,12 +515,16 @@ class Scheduler(SchedulerIOMixin):
                         # graph-replayed step cannot expose its target hidden, so the
                         # chain bridges with the draft's own z. Drafts are candidates
                         # only -- this never changes committed tokens.
-                        self.mtp_manager.on_decode_committed(req, next_token, finished=False)
+                        self.mtp_manager.on_decode_committed(
+                            req, next_token, finished=False, rechain=False
+                        )
                     elif hidden_offsets is not None:
                         # Final prefill chunk: seed the draft head over the whole
                         # prompt and chain the first draft list.
                         rows = batch.hidden_states[hidden_offsets[i] : hidden_offsets[i + 1]]
-                        self.mtp_manager.on_prefill_hidden(req, rows, final=True)
+                        self.mtp_manager.on_prefill_hidden(
+                            req, rows, final=True, rechain=False
+                        )
 
         # GDN spec rollback: restore the pre-forward state snapshot of every
         # partially-accepted request and re-advance it over the accepted span with
@@ -524,6 +534,14 @@ class Scheduler(SchedulerIOMixin):
         # before scheduling).
         if spec_replays:
             self._replay_spec_states(spec_replays, batch)
+
+        # Batched rechain for every chain the drain hooks deferred: one sweep of the
+        # draft weights per chain step for the whole batch (per-request rechain is
+        # the dominant draft cost at C>=2). Must precede the next batch's
+        # scheduling: a pending state has no fresh draft_t and seat_drafts would
+        # fall back to a plain decode batch.
+        if self.mtp_manager is not None:
+            self.mtp_manager.flush_rechain()
 
         # Periodic spec-decode health line: avg committed tokens per verify and the
         # draft-utilization ratio (accepted+bonus / drafted) -- the two numbers that
