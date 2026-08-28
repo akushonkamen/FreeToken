@@ -5,6 +5,14 @@ from .model import (
     Qwen4ExpModel,
     Qwen4GatedResidual,
 )
+from .mtp import (
+    MTPExperts,
+    MTPHyperLayer,
+    MTPMoE,
+    Qwen4ExpMTPDraft,
+    fuse_mtp_state,
+    load_mtp_state_dict,
+)
 from .ple import Qwen4GroupRMSNorm, Qwen4PleEmbedding, Qwen4PleLayer
 from .weight import (
     iter_weights,
@@ -25,4 +33,10 @@ __all__ = [
     "Qwen4PleLayer",
     "Qwen4PleEmbedding",
     "Qwen4GroupRMSNorm",
+    "Qwen4ExpMTPDraft",
+    "MTPHyperLayer",
+    "MTPMoE",
+    "MTPExperts",
+    "load_mtp_state_dict",
+    "fuse_mtp_state",
 ]

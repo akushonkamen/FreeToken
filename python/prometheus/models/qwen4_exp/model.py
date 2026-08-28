@@ -146,12 +146,17 @@ class Qwen4ExpModel(BaseOP):
         )
         self._hc = config.q4_args.hc_count
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward_hidden(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Run the decoder stack and return the PRE-MIXER hyper stream
+        [T, hc_count*hidden] (the MTP drafter's input; the mixer folds it down)."""
         x = self.embed_tokens.forward(input_ids)
         x = x.repeat(1, self._hc)  # every stream starts from the same embedding
         for layer in self.layers.op_list:
             x = layer.forward(x, input_ids)
-        return self.hyper_connection_mixer.forward(x)
+        return x
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.hyper_connection_mixer.forward(self.forward_hidden(input_ids))
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
@@ -175,8 +180,36 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         super().__init__()
 
     def forward(self) -> torch.Tensor:
-        input_ids = get_global_ctx().batch.input_ids
-        return self.lm_head.forward(self.model.forward(input_ids))
+        batch = get_global_ctx().batch
+        x = self.model.forward_hidden(batch.input_ids)
+        if batch.return_hidden:
+            # MTP spec path: the scheduler-side drafter consumes the target's
+            # last-layer PRE-MIXER hyper states (this [T, 10240] tensor) at drain
+            # time, outside the forward ctx -- NOT the post-mixer mixed hidden.
+            batch.hidden_states = x
+        return self.lm_head.forward(self.model.hyper_connection_mixer.forward(x))
+
+    def build_mtp_draft(self, model_path: str, device: torch.device):
+        """Build the qwen4_exp MTP draft head from the checkpoint's bf16 mtp.*
+        tensors, sharing this model's embed_tokens and lm_head by reference.
+        Raises when the checkpoint carries no MTP head."""
+        from prometheus.layers import ParallelLMHead
+
+        from .mtp import Qwen4ExpMTPDraft, load_mtp_state_dict
+
+        assert isinstance(self.lm_head, ParallelLMHead), (
+            "--spec-mtp requires the plain bf16 lm_head (untied, unquantized)"
+        )
+        state = load_mtp_state_dict(model_path, device)
+        if state is None:
+            raise ValueError(f"--spec-mtp: no MTP draft head (mtp.*) in {model_path}")
+        from prometheus.utils import torch_dtype
+
+        with torch.device(device), torch_dtype(torch.bfloat16):
+            draft = Qwen4ExpMTPDraft(self._config, self.model.embed_tokens, self.lm_head)
+        draft.load_state_dict(state)
+        draft.quantize_linears_nvfp4()
+        return draft
 
     def prepare_for_runtime(self) -> None:
         q4: Qwen4ExpArgs = self._config.q4_args
