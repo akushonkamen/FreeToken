@@ -410,8 +410,16 @@ class GraphRunner:
         # the capture. Flag the batch and size the model's persistent buffers
         # BEFORE the warmup run, so _ngram_embeddings/_conv_forward read only the
         # staged buffers inside the captured region.
+        #
+        # Size ONLY the spec-owned buffers (prepare_spec_graph_capture). Do NOT
+        # route through model.prepare_cuda_graph_capture here: that call sizes the
+        # DECODE graphs' staging (qwen4_exp PLE grows _graph_output [bs] -> [ext]),
+        # and the decode graphs are already captured -- a realloc orphans their
+        # captured reads of the old storage and every later decode replay computes
+        # on freed memory (observed: first decode step after prefill writes NaN
+        # into the GDN/PLE state pools). The decode capture pass already ensured
+        # the shared pools exist before this runs.
         batch.cuda_graph_capture = True
-        model.prepare_cuda_graph_capture(batch)
         spec_capture_prep = getattr(model, "prepare_spec_graph_capture", None)
         if spec_capture_prep is not None:
             spec_capture_prep(ext)
