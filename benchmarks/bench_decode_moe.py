@@ -100,6 +100,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="hybrid: max PCIe fetches/layer; -1 = auto (benched pcie/cpu bandwidth fraction)",
     )
     p.add_argument("--mem-ratio", type=float, default=0.9, help="target VRAM utilization")
+    p.add_argument("--gpu", default=None,
+                   help="GPU for the serve: a UUID or nvidia-smi index (as prom serve --gpu)")
     p.add_argument("--no-graph", action="store_true", help="eager decode instead of CUDA graph")
     p.add_argument(
         "--greedy",
@@ -192,6 +194,8 @@ def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
     _t = _os.getenv("PROMETHEUS_BENCH_MOE_CPU_THREADS")
     if _t:
         cmd += ["--moe-cpu-threads", _t]
+    if args.gpu:
+        cmd += ["--gpu", args.gpu]
     if args.cache > 0:
         cmd += ["--moe-cache-size", str(args.cache)]
     elif args.cache_rate is not None:
