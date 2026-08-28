@@ -156,6 +156,9 @@ class Batch:
     # accept can re-advance the state over the accepted rows without replaying a full
     # model forward (Scheduler._replay_spec_states). None on every other batch.
     spec_gdn_stash: dict | None = field(default=None, init=False)
+    # True only for the static dummy batch while CUDA graphs are captured. Models
+    # with host-prepared inputs use this to bind stable device buffers into the graph.
+    cuda_graph_capture: bool = field(default=False, init=False)
     padded_reqs: List[Req] = field(init=False)
     # DSV4 paged-KV out-locations for this batch (None for non-DSV4 models). Set by the scheduler.
     # This decode batch's padded per-row page-table rows. Attention backends that must read

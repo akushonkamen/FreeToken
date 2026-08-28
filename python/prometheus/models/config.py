@@ -305,6 +305,8 @@ class ModelConfig:
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
+    requires_naive_cache: bool = False  # model owns host/runtime state radix cannot snapshot
+    supports_cuda_graph: bool = True  # False when forward performs host-side dynamic work
 
     @property
     def is_moe(self) -> bool:
