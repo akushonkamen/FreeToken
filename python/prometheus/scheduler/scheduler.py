@@ -398,6 +398,16 @@ class Scheduler(SchedulerIOMixin):
                     # Spec-verify drain: commit the verified prefix, roll the rejected
                     # KV back, and skip the radix commit below (v1 spec spans never
                     # enter the prefix cache).
+                    import os as _os
+                    if _os.getenv("PROM_MTP_TRACE"):
+                        import sys as _sys
+                        print(
+                            f"[SCH-TRACE] spec drain uid={req.uid} m={req.cached_len} "
+                            f"hidden={'Y' if batch.hidden_states is not None else 'N'} "
+                            f"row={spec_row} ext={req.device_len - req.cached_len} "
+                            f"size={batch.size} drafts={batch.spec_drafts[i]}",
+                            file=_sys.stderr, flush=True,
+                        )
                     ext = req.device_len - req.cached_len
                     preds = next_tokens_cpu[spec_row - ext : spec_row].tolist()
                     # Capture the pre-commit lens + the verify rows' target hiddens
@@ -426,10 +436,13 @@ class Scheduler(SchedulerIOMixin):
                     self._spec_steps += 1
                     self._spec_committed += len(spec_reply)
                     self._spec_drafted += len(batch.spec_drafts[i])
-                    if spec_hidden is not None:
-                        self.mtp_manager.on_spec_accept(
-                            req, spec_m, spec_hidden, preds, batch.spec_drafts[i], spec_finished
-                        )
+                    # Always advance the MTP chain on a spec commit -- a skipped
+                    # hook desyncs valid_len from the committed stream and the next
+                    # verify asserts. hidden=None (batch without stashed target
+                    # hiddens) takes the drafter's z-substitution rollout instead.
+                    self.mtp_manager.on_spec_accept(
+                        req, spec_m, spec_hidden, preds, batch.spec_drafts[i], spec_finished
+                    )
                     if spec_replay is not None:
                         spec_replays.append(spec_replay)
                         self._spec_replays += 1
@@ -1146,6 +1159,16 @@ class Scheduler(SchedulerIOMixin):
             and self.engine.spec_attn is not None
             and self.engine.graph_runner.can_use_spec_graph(batch)
         )
+        import os as _os
+        if _os.getenv("PROM_MTP_TRACE") and batch.spec_verify:
+            import sys as _sys
+            print(
+                f"[SCH-TRACE] prepare spec batch size={batch.size} "
+                f"uids={[r.uid for r in batch.reqs]} "
+                f"exts={[r.device_len - r.cached_len for r in batch.reqs]} "
+                f"cached={[r.cached_len for r in batch.reqs]} spec_graphed={spec_graphed}",
+                file=_sys.stderr, flush=True,
+            )
         if batch.is_decode:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
             # so they can back the new token -- this is what bounds the per-request swa

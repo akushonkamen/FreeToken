@@ -366,9 +366,10 @@ class _MTPReqState:
     post-norm output for x_{valid_len} (predicts position valid_len + 1); chain_z[i]
     is the output that produced draft[i + 1]."""
 
-    __slots__ = ("k_cache", "v_cache", "cap", "valid_len", "z", "draft_t", "draft_pin", "draft_n", "chain_z")
+    __slots__ = ("k_cache", "v_cache", "cap", "valid_len", "z", "draft_t", "draft_pin", "draft_n", "chain_z", "hist")
 
     def __init__(self, k_cache: torch.Tensor, v_cache: torch.Tensor):
+        self.hist: List[tuple] = []
         self.k_cache = k_cache
         self.v_cache = v_cache
         self.cap = k_cache.shape[0]
@@ -381,6 +382,13 @@ class _MTPReqState:
         self.draft_pin: torch.Tensor | None = None
         self.draft_n: int = 0
         self.chain_z: List[torch.Tensor] = []
+
+
+def _trace(msg: str) -> None:
+    import os
+    import sys
+    if os.getenv("PROM_MTP_TRACE"):
+        print(f"[MTP-TRACE] {msg}", file=sys.stderr, flush=True)
 
 
 class MTPDraftManager:
@@ -413,14 +421,32 @@ class MTPDraftManager:
         Also refreshes each state's pinned mirror (async D2H): the caller's drain
         materializes the CPU lists from it after the forward drains, so the chain
         never host-syncs between verify steps."""
-        drafts: List[torch.Tensor] = []
+        # Two-pass: validate EVERY req before mutating ANY state. A mid-loop bail
+        # (e.g. a sibling req whose prefill is still in flight -> state is None)
+        # used to leave earlier reqs' chains trimmed while the caller fell back to
+        # a plain decode batch -- the trimmed state then desynced from the
+        # committed stream at the next verify (valid_len == m - 1).
+        budgets: List[int] = []
         for req in reqs:
             state = self.states.get(req.uid)
             if state is None or state.draft_t is None or state.draft_n == 0:
+                _trace(
+                    f"FALLBACK seat: uid={req.uid} "
+                    f"state={'None' if state is None else 'dry'} "
+                    f"running={[r.uid for r in reqs]}"
+                )
                 return None
             budget = min(k, state.draft_n, req.remain_len - 1)
             if budget <= 0:
+                _trace(
+                    f"FALLBACK seat: uid={req.uid} budget={budget} "
+                    f"draft_n={state.draft_n} remain={req.remain_len}"
+                )
                 return None
+            budgets.append(budget)
+        drafts: List[torch.Tensor] = []
+        for req, budget in zip(reqs, budgets):
+            state = self.states[req.uid]
             # Keep the state 1:1 with the seated list (acceptance bookkeeping reads
             # chain rows by position against it). The batch holds the same tensor
             # object; re-chaining REPLACES it (never mutates in place), so the
@@ -433,6 +459,7 @@ class MTPDraftManager:
                     self.num_draft, dtype=torch.int64, pin_memory=True
                 )
             state.draft_pin[:budget].copy_(state.draft_t, non_blocking=True)
+            _trace(f"seat uid={req.uid} budget={budget} valid_len={state.valid_len} cached_len={req.cached_len} device_len={req.device_len}")
             drafts.append(state.draft_t)
         return drafts
 
@@ -456,7 +483,8 @@ class MTPDraftManager:
             if not req.sampling_params.is_greedy or req.mm_embeds is not None:
                 self._ineligible.add(req.uid)
                 return
-            if req.cached_len - hidden_rows.shape[0] != (1 if final else 0):
+            bridge_n = req.cached_len - hidden_rows.shape[0] - (1 if final else 0)
+            if bridge_n > 0:
                 # Prefix-cache hit: rows [0, C - rows - final) were never forwarded
                 # this run, so their target hiddens do not exist. Bridge them with
                 # the z-substitution the decode path uses (the draft's own hidden
@@ -464,17 +492,39 @@ class MTPDraftManager:
                 # tokens, so the draft KV still covers the whole prompt. One-time
                 # cost at admission; lossless (drafts are only candidates).
                 state = self._alloc(req)
-                self._bridge_prefix(state, req, req.cached_len - hidden_rows.shape[0] - (1 if final else 0))
+                self._bridge_prefix(state, req, bridge_n)
             else:
+                # bridge_n == 0 (full forward this run) or < 0 (final hook where
+                # cached_len does not yet count the sampled bonus -- batch-shape
+                # dependent complete_one ordering): nothing to bridge either way.
                 state = self._alloc(req)
         C = req.cached_len
         rows = hidden_rows.shape[0]
-        if state.valid_len != C - rows - (1 if final else 0):
+        expected = C - rows - (1 if final else 0)
+        # The final-chunk hook's cached_len may or may not include the sampled
+        # bonus yet (both orderings occur depending on batch shape), so accept
+        # the +/-1 both conventions produce. A genuinely skipped chunk shifts
+        # coverage by a whole chunk (rows >> 1) and still trips this.
+        if state.valid_len not in (expected, expected + 1):
             # Hidden-row coverage broke (skipped chunk); drop the request from spec.
+            _trace(
+                f"DROP prefill uid={req.uid} final={final} "
+                f"valid_len={state.valid_len} C={C} rows={rows} hist={state.hist}"
+            )
             self.remove(req.uid)
             self._ineligible.add(req.uid)
             return
-        tokens = req.input_ids[state.valid_len + 1 : C if final else C + 1]
+        state.hist.append(("prefill", state.valid_len, C, rows, 1 if final else 0))
+        state.hist = state.hist[-12:]
+        _trace(f"prefill uid={req.uid} final={final} valid_len={state.valid_len} C={C} rows={rows}")
+        # Row r of the chunk pairs token x_{valid+r+1}: exactly `rows` tokens. The
+        # end index derives from rows (authoritative), not C -- C's bonus-inclusion
+        # at the final hook is ordering-dependent. Under the counted-bonus
+        # convention this is identical to the old `C` / `C+1` endpoints.
+        end = state.valid_len + 1 + rows
+        if final:
+            end = min(end, req.input_ids.numel())
+        tokens = req.input_ids[state.valid_len + 1 : end]
         need = state.valid_len + rows + (self.num_draft - 1 if final else 0)
         self._ensure_cap(state, need, req.max_device_len)
         self._run_pairs(state, tokens, hidden_rows)
@@ -491,7 +541,14 @@ class MTPDraftManager:
         state = self.states.get(req.uid)
         if state is None:
             return
-        if state.draft_t is not None and state.draft_n > 0 and int(state.draft_t[0]) == token:
+        # draft_n == 1 (num_draft=1, e.g. --spec-mtp 1) leaves chain_z empty and the
+        # committed token's KV row unwritten: there is no chain row to consume, so
+        # take the substitution path (run the pair, reseed) instead of popping.
+        if (
+            state.draft_t is not None
+            and state.draft_n > 1
+            and int(state.draft_t[0]) == token
+        ):
             # The first pending draft was exactly right: keep its chain row (the
             # token/position pair match by construction) and the rest of the chain.
             # (int() host-syncs, but this fallback-decode path runs with the chain
@@ -500,6 +557,9 @@ class MTPDraftManager:
             state.draft_n -= 1
             state.z = state.chain_z.pop(0)
             state.valid_len += 1
+            state.hist.append(("decode-fast", state.valid_len, req.cached_len, state.draft_n))
+            state.hist = state.hist[-12:]
+            _trace(f"decode-fast uid={req.uid} valid_len={state.valid_len} cached_len={req.cached_len}")
             return
         # Mismatch (or drained chain): z-substitution -- feed the committed token
         # against the draft's last hidden, then re-seed the chain. Drafts are only
@@ -508,12 +568,15 @@ class MTPDraftManager:
         self._ensure_cap(state, state.valid_len + 1 + self.num_draft - 1, req.max_device_len)
         self._run_pairs(state, tokens, state.z)
         self._rechain(state, req.max_device_len)
+        state.hist.append(("decode-subst", state.valid_len, req.cached_len, state.draft_n))
+        state.hist = state.hist[-12:]
+        _trace(f"decode-subst uid={req.uid} valid_len={state.valid_len} cached_len={req.cached_len}")
 
     def on_spec_accept(
         self,
         req: "Req",
         m: int,
-        hidden_rows: torch.Tensor,
+        hidden_rows: torch.Tensor | None,
         preds: List[int],
         draft: List[int],
         finished: bool,
@@ -531,16 +594,44 @@ class MTPDraftManager:
             return
         # Quiescent invariant: valid_len == m (row r holds token x_{r+1}; rows
         # x_1..x_valid_len built, and m = cached_len with committed == m+1).
+        # One legal exception: the FIRST verify after prefill can run with no
+        # intervening plain decode (overlap scheduling admits the spec batch
+        # straight off the prefill drain), and on_prefill_hidden deliberately
+        # leaves the seated token x_m's row unbuilt (it needs the pre-forward
+        # hidden, unavailable at prefill time). Bridge it with z-substitution --
+        # exactly the substitution on_decode_committed's fallback and the prefix
+        # bridge use. Lossless: drafts are only candidates.
+        if state.valid_len == m - 1:
+            seated = torch.tensor([int(req.input_ids[m])], dtype=torch.int32)
+            self._ensure_cap(state, m + self.num_draft, req.max_device_len)
+            self._run_pairs(state, seated, state.z)
+        if state.valid_len != m:
+            _trace(
+                f"DESYNC uid={req.uid} valid_len={state.valid_len} m={m} "
+                f"cached_len={req.cached_len} device_len={req.device_len} "
+                f"draft_n={state.draft_n} ineligible={self._ineligible} "
+                f"hist={state.hist}"
+            )
         assert state.valid_len == m, "MTP chain desynced from the committed stream"
+        state.hist.append(("accept", state.valid_len, m, req.cached_len, state.draft_n))
+        state.hist = state.hist[-12:]
+        _trace(f"accept uid={req.uid} m={m} cached_len={req.cached_len} draft={draft} preds={preds}")
         accepted = 0
         while accepted < len(draft) and preds[accepted] == draft[accepted]:
             accepted += 1
         keep = min(accepted, len(draft) - 1)
         state.valid_len = m + keep  # chain rows [m, m+keep) survive verbatim
         tokens = torch.tensor(draft[keep:accepted] + [preds[accepted]], dtype=torch.int32)
-        hiddens = hidden_rows[keep : accepted + 1]
         self._ensure_cap(state, state.valid_len + tokens.shape[0] + self.num_draft - 1, req.max_device_len)
-        self._run_pairs(state, tokens, hiddens)
+        if hidden_rows is not None:
+            hiddens = hidden_rows[keep : accepted + 1]
+            self._run_pairs(state, tokens, hiddens)
+        else:
+            # Degraded drain (no target hiddens on the batch): roll the rejected
+            # tail + bonus out with the draft's own z -- the same substitution the
+            # prefix bridge uses, just chained. Keeps valid_len exact; drafts stay
+            # candidates, so the committed stream is untouched.
+            self._rollout_z(state, tokens)
         self._rechain(state, req.max_device_len)
 
     # ---------------- GPU plumbing ----------------
@@ -564,9 +655,23 @@ class MTPDraftManager:
             state.valid_len += 1
         state.z = z
 
+    def _rollout_z(self, state: _MTPReqState, tokens: torch.Tensor) -> None:
+        """Sequentially forward (token, previous z) pairs, appending KV rows at
+        valid_len -- the z-substitution rollout used when a verify drain has no
+        target hiddens for the rejected tail."""
+        z = state.z
+        toks = tokens.to(self.device, dtype=torch.int32)
+        for i in range(toks.shape[0]):
+            z = self.draft.forward_tokens(
+                toks[i : i + 1], z, state.valid_len + 1, state.k_cache, state.v_cache, state.valid_len
+            )
+            state.valid_len += 1
+        state.z = z[-1:]
+
     def _alloc(self, req: "Req") -> _MTPReqState:
         kv_dim = self.draft.num_kv * self.draft.head_dim
         cap = min(req.max_device_len, max(1024, req.cached_len + self.num_draft + 1))
+        _trace(f"alloc uid={req.uid} cached_len={req.cached_len}")
         state = _MTPReqState(
             k_cache=torch.empty(cap, kv_dim, dtype=torch.bfloat16, device=self.device),
             v_cache=torch.empty(cap, kv_dim, dtype=torch.bfloat16, device=self.device),

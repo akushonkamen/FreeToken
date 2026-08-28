@@ -286,6 +286,16 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--linear-state-cache-ratio",
+        type=float,
+        default=ServerArgs.linear_state_cache_ratio,
+        help=(
+            "GDN state snapshot-cache slots per running request (hybrid-radix). "
+            "Lower it to shrink the linear state pool on tight-VRAM multi-request setups."
+        ),
+    )
+
     assert ServerArgs.use_dummy_weight == False
     parser.add_argument(
         "--dummy-weight",
