@@ -158,6 +158,25 @@ class Qwen4ExpModel(BaseOP):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.hyper_connection_mixer.forward(self.forward_hidden(input_ids))
 
+    def readvance_gdn_states(self, stash: dict, start: int, rows: int, slot: int,
+                             device: torch.device,
+                             graph_consts: tuple | None = None) -> None:
+        """Spec partial-accept rollback: re-advance every GDN layer's conv + recurrent
+        state over rows [start, start+rows) of the stashed spec-verify span
+        (Scheduler._replay_spec_states). Attention layers need no state rollback --
+        their KV for the accepted rows was already written correctly by the verify
+        forward. Same layer topology as qwen3_5 (``_is_linear`` GDN mixers keyed by
+        ``linear_attn.layer_id``); ``graph_consts`` carries the rechain graph's
+        persistent buffers on the replay path."""
+        for layer in self.layers.op_list:
+            if layer._is_linear:
+                conv_in, a, b = stash[layer.linear_attn.layer_id]
+                layer.linear_attn.spec_readvance(
+                    conv_in[start : start + rows], a[start : start + rows],
+                    b[start : start + rows], slot, device,
+                    graph_consts=graph_consts,
+                )
+
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
     """Text tower of Qwen4ExpForConditionalGeneration (Qwen3.8-Flash-Next).
@@ -188,6 +207,15 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             # time, outside the forward ctx -- NOT the post-mixer mixed hidden.
             batch.hidden_states = x
         return self.lm_head.forward(self.model.hyper_connection_mixer.forward(x))
+
+    def readvance_gdn_states(self, stash: dict, start: int, rows: int, slot: int,
+                             device: torch.device,
+                             graph_consts: tuple | None = None) -> None:
+        """Delegate to the backbone (spec partial-accept rollback entry point for the
+        scheduler; see Qwen4ExpModel.readvance_gdn_states)."""
+        return self.model.readvance_gdn_states(
+            stash, start, rows, slot, device, graph_consts=graph_consts,
+        )
 
     def build_mtp_draft(self, model_path: str, device: torch.device):
         """Build the qwen4_exp MTP draft head from the checkpoint's bf16 mtp.*
