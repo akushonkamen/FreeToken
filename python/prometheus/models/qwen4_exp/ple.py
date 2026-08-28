@@ -121,6 +121,11 @@ class Qwen4PleEmbedding(BaseOP):
         # CUDA-graph staging: the captured decode reads the host-gathered ngram rows
         # from this stable device buffer; it is filled eagerly before each replay.
         self._graph_output: torch.Tensor | None = None
+        # Spec-verify graph staging: a SEPARATE buffer, because the decode graphs
+        # capture reads of _graph_output's storage and a later realloc (the spec
+        # graph is captured after them, with ext = 1+k rows) would orphan those
+        # captured pointers.
+        self._spec_graph_output: torch.Tensor | None = None
 
     def padded_vocab(self) -> int:
         # HF: offsets are cumulative head start rows, so total = last offset + last
@@ -231,6 +236,22 @@ class Qwen4PleEmbedding(BaseOP):
         emb = self._table.index_select(0, cpu_ids).view(ids.shape[0], -1)
         self._graph_output[: emb.shape[0]].copy_(emb)
 
+    def prepare_spec_graph_capture(self, token_count: int, device: torch.device) -> None:
+        """Size the spec-verify graph's ngram staging buffer before capture."""
+        if self._spec_graph_output is None or self._spec_graph_output.shape[0] < token_count:
+            self._spec_graph_output = torch.zeros(
+                token_count, self._ngram_heads * self._head_dim,
+                device=device, dtype=torch.bfloat16,
+            )
+
+    def stage_spec_graph_output(self, s0: torch.Tensor, s1: torch.Tensor, s2: torch.Tensor) -> None:
+        """Eagerly run the host-side ngram gather into the spec graph's buffer."""
+        assert self._spec_graph_output is not None, "stage before prepare_spec_graph_capture"
+        ids = self._head_ids(s0, s1, s2)  # [N, ngram_heads] int64
+        cpu_ids = ids.reshape(-1).cpu()
+        emb = self._table.index_select(0, cpu_ids).view(ids.shape[0], -1)
+        self._spec_graph_output[: emb.shape[0]].copy_(emb)
+
 
 class Qwen4PleLayer(BaseOP):
     """Per-Layer Embedding (HF ``Qwen4ExpTextPLELayer``) for the serving engine.
@@ -268,6 +289,11 @@ class Qwen4PleLayer(BaseOP):
         self._hist = None        # [S, 2] int64: (id_{p-2}, id_{p-1})
         self._last_eos = None    # [S] int64: absolute position of last eos, -1 = none
         self._conv_state = None  # [S, hc, conv_state_len] bf16, conv INPUT window
+        # Spec-verify support: the verify forward's conv-input stash for the graph
+        # path (the eager path stashes into batch.spec_ple_stash instead), and the
+        # pre-forward state snapshot the drain-side partial-accept rollback uses.
+        self._spec_conv_buf: torch.Tensor | None = None
+        self._spec_snap: dict = {}
 
     def prepare(self, device: torch.device) -> None:
         self.ple_embedding.prepare(device)
@@ -301,6 +327,88 @@ class Qwen4PleLayer(BaseOP):
         self._hist[slots, 0] = hist[:, 1]
         self._hist[slots, 1] = s0
         self._last_eos[slots] = torch.where(s0 == self._eos, pos, le)
+
+    def prepare_spec_graph_capture(self, token_count: int) -> None:
+        """Size the spec-verify graph's PLE buffers before capture: the ngram
+        staging buffer and the conv-input stash (allocated here so the warmup run
+        and the captured region never allocate)."""
+        device = self.conv1d.weight.device
+        self.ple_embedding.prepare_spec_graph_capture(token_count, device)
+        if self._spec_conv_buf is None or self._spec_conv_buf.shape[0] < token_count:
+            self._spec_conv_buf = torch.zeros(
+                token_count, self._hc_dim, dtype=torch.bfloat16, device=device
+            )
+
+    def prepare_spec_graph_replay(self, batch) -> None:
+        """Host half of the PLE spec-verify step, run eagerly before the spec graph
+        replays: stage the 1+k verify rows' ngram embeddings from the CURRENT hist
+        (exact -- the previous drain corrected it after the last commit). Unlike
+        decode replay prep this does NOT slide hist/last-eos: a partial accept
+        would leave them past the committed prefix, so the scheduler drain owns
+        the post-commit correction (spec_commit, from the committed ids)."""
+        ids = batch.input_ids.reshape(-1).to(torch.int64)
+        L = ids.shape[0]
+        slots = batch.fla_metadata.cache_indices.to(torch.int64)
+        hist = self._hist[slots]   # [1, 2]
+        win = torch.cat([hist.reshape(-1), ids])  # [2 + L]
+        # Shifted views with HF's exact windowed segment logic (see the eager
+        # prefill branch): s_k[i] = win[i + 2 - k], valid iff sp[i] >= k where sp
+        # comes from window-coordinate eos positions.
+        wlocal = torch.arange(L + 2, device=ids.device, dtype=torch.int64)
+        weos = torch.where(win == self._eos, wlocal, torch.full_like(wlocal, -1))
+        prev_excl = torch.cat(
+            [weos.new_full((1,), -1), torch.cummax(weos, dim=0).values[:-1]]
+        )
+        sp = (wlocal - prev_excl - 1)[2:]
+        eos = ids.new_full((), self._eos)
+        s1 = torch.where(sp >= 1, win[1 : 1 + L], eos)
+        s2 = torch.where(sp >= 2, win[0:L], eos)
+        self.ple_embedding.stage_spec_graph_output(ids, s1, s2)
+
+    def spec_snapshot(self, slots) -> None:
+        """Pre-forward snapshot of the spec batch's PLE state rows. The verify
+        forward advances hist/last-eos/conv window by the full 1+k draft rows
+        (eager prefill branch, or the captured writeback); a partial accept must
+        re-land them at m+committed, which needs the pre-forward values. Device-side
+        clones only -- no host sync on the scheduling path."""
+        self._spec_snap = {
+            int(s): (
+                self._hist[s].clone(),        # [2]
+                self._last_eos[s].clone(),    # []
+                self._conv_state[s].clone(),  # [hc, conv_state_len]
+            )
+            for s in slots
+        }
+
+    def spec_commit(self, slot: int, m: int, committed_ids) -> None:
+        """Exact post-commit hist/last-eos correction: leave the state exactly the
+        equivalent ``committed`` greedy decode steps would have. Called by the
+        scheduler drain for every non-finished spec commit (both graph and eager
+        paths -- the graph path never slides, the eager path over-slides)."""
+        snap = self._spec_snap.get(slot)
+        if snap is None:
+            return
+        h, le, _conv = snap
+        ids_t = torch.tensor(committed_ids, dtype=torch.int64, device=h.device)
+        # hist = last 2 of (snapshot hist ++ committed ids)
+        w = torch.cat([h, ids_t])
+        self._hist[slot, 0], self._hist[slot, 1] = w[-2], w[-1]
+        # last eos = max(snapshot's, last eos among the committed ids at abs pos)
+        idx = torch.arange(ids_t.shape[0], device=h.device, dtype=torch.int64)
+        epos = torch.where(ids_t == self._eos, m + idx, torch.full_like(idx, -1))
+        self._last_eos[slot] = torch.maximum(le, epos.max())
+
+    def spec_readvance(self, stash_conv_in: torch.Tensor, start: int, committed: int,
+                       slot: int) -> None:
+        """Re-land the conv-input window at m+committed after a partial accept:
+        (snapshot window ++ the committed rows' conv inputs)[-conv_state_len:]."""
+        snap = self._spec_snap.get(slot)
+        assert snap is not None, "PLE spec readvance without a pre-forward snapshot"
+        rows = stash_conv_in[start : start + committed]  # [committed, hc]
+        new = torch.cat(
+            [snap[2], rows.transpose(0, 1)], dim=-1
+        )[..., -self._conv_state_len :]
+        self._conv_state[slot] = new
 
     def _ensure_slots(self, n: int, device) -> None:
         if self._hist is not None and self._hist.shape[0] >= n:
@@ -342,6 +450,14 @@ class Qwen4PleLayer(BaseOP):
     def _ngram_embeddings(self, ids: torch.Tensor, fla, batch) -> torch.Tensor:
         """ids: flat [T] int64 for this forward. Returns [T, ple_embed_dim]."""
         emb = self.ple_embedding
+        if batch.cuda_graph_capture and batch.spec_verify:
+            # Spec-verify graph: the 1+k rows' ngram gather was staged eagerly by
+            # prepare_spec_graph_replay (which leaves hist alone -- the drain owns
+            # the post-commit correction). The captured region reads only the
+            # staged buffer; everything below host-syncs on cu_seqlens.
+            out = emb._spec_graph_output
+            assert out is not None, "spec graph capture before PLE spec staging buffer"
+            return out[: ids.shape[0]]
         if batch.is_decode:
             if batch.cuda_graph_capture:
                 # Graph decode: the ngram rows were staged eagerly (replay prep
@@ -384,31 +500,36 @@ class Qwen4PleLayer(BaseOP):
             L = end - beg
             ids_r = ids[beg:end]
             pos0 = int(positions[beg])
-            # History window [id_{p-2}, id_{p-1}] ++ chunk ids; shifted views are
-            # contiguous slices of it (length L each).
+            # History window [id_{p-2}, id_{p-1}] ++ chunk ids; the shift-k view of
+            # row i is win[i + 2 - k] (HF: shifted_k over the full history, last L
+            # rows), i.e. s1 = win[1:L+1] and s2 = win[0:L]. (s2 used to read
+            # win[2:2+L] -- each row's OWN token, breaking both HF parity and the
+            # decode branch's semantics; verified against the real HF method.)
             win = torch.cat([self._hist[slot], ids_r])  # [L + 2]
             t2, t1 = self._hist[slot, 0], self._hist[slot, 1]
-            le = int(self._last_eos[slot].item())
-            # Segment positions within the chunk (HF _shift_right_ignore_eos):
-            # sp_i = i - prev_eos_rel(i) - 1, prev_eos in chunk-relative coordinates.
-            local = torch.arange(L, device=ids.device, dtype=torch.int64)
-            eos_pos = torch.where(ids_r == self._eos, local, torch.full_like(local, -1))
-            prev_incl = torch.cummax(eos_pos, dim=0).values
+            # Segment distance, exactly HF's windowed _shift_right_ignore_eos: eos
+            # positions live in WINDOW coordinates (0..L+1) so the -1 "no eos"
+            # sentinel cannot collide with a real position, and the initial
+            # previous_eos is -1 (a fresh request's hist is eos-initialized, so an
+            # eos inside the window is seen at its own index). The old chunk-local
+            # cummax lost both properties and eos-filled row 1's trigram whenever
+            # no eos sat inside the chunk.
+            wlocal = torch.arange(L + 2, device=ids.device, dtype=torch.int64)
+            weos = torch.where(win == self._eos, wlocal, torch.full_like(wlocal, -1))
             prev_excl = torch.cat(
-                [
-                    torch.tensor([le - pos0], device=ids.device, dtype=torch.int64),
-                    prev_incl[:-1],
-                ]
+                [weos.new_full((1,), -1), torch.cummax(weos, dim=0).values[:-1]]
             )
-            sp = local - prev_excl - 1
+            sp = wlocal - prev_excl - 1  # row i's distance = sp[i + 2]
+            sp = sp[2:]
             s0 = ids_r
             s1 = torch.where(sp >= 1, win[1 : 1 + L], ids_r.new_full((), self._eos))
-            s2 = torch.where(sp >= 2, win[2 : 2 + L], ids_r.new_full((), self._eos))
+            s2 = torch.where(sp >= 2, win[0:L], ids_r.new_full((), self._eos))
             embs.append(emb.forward(s0, s1, s2))
             # Slide the history window: last 2 of (old hist ++ chunk ids).
             self._hist[slot, 0] = ids_r[-2] if L >= 2 else t1
             self._hist[slot, 1] = ids_r[-1]
-            new_le = eos_pos[eos_pos >= 0]
+            new_le = weos[2:]
+            new_le = new_le[new_le >= 0]
             if new_le.numel() > 0:
                 self._last_eos[slot] = pos0 + int(new_le.max().item())
         return torch.cat(embs, dim=0)
@@ -425,6 +546,30 @@ class Qwen4PleLayer(BaseOP):
             out = F.silu(F.conv1d(x, w, groups=x.shape[1], dilation=dilation))
             self._conv_state[slots] = x[..., 1:]
             return out.squeeze(-1)
+        if batch.cuda_graph_capture and batch.spec_verify:
+            # Spec-verify graph: static single-chunk shape (bs=1, L=1+k), so the
+            # host cu_seqlens loop below is both illegal under capture (D2H sync)
+            # and unnecessary -- everything here is a device op on the one chunk.
+            # The captured state writeback advances over ALL 1+k rows; the conv
+            # inputs are stashed so the drain can re-land the window on a partial
+            # accept (spec_readvance).
+            slots = fla.cache_indices.to(torch.int64)
+            state = self._conv_state[slots]  # [1, C, W]
+            x = torch.cat([state, conv_in.unsqueeze(0).transpose(1, 2)], dim=-1)
+            out = F.silu(F.conv1d(x, w, groups=x.shape[1], dilation=dilation))
+            self._conv_state[slots] = x[..., -self._conv_state_len :]
+            buf = self._spec_conv_buf
+            assert (
+                buf is not None and buf.shape[0] >= conv_in.shape[0]
+            ), "spec graph conv stash missing (prepare_spec_graph_capture)"
+            buf[: conv_in.shape[0]].copy_(conv_in)
+            return out.squeeze(0).transpose(0, 1)
+        if batch.spec_verify:
+            # Eager spec verify: stash this layer's full-batch conv inputs for the
+            # drain-side partial-accept re-advance (mirror of the GDN spec stash).
+            if batch.spec_ple_stash is None:
+                batch.spec_ple_stash = {}
+            batch.spec_ple_stash[self._layer_id] = conv_in
         cu = fla.cu_seqlens
         if cu.device.type != "cpu":
             cu = cu.cpu()

@@ -169,6 +169,66 @@ class Qwen4ExpModel(BaseOP):
             if hasattr(layer, "ple"):
                 layer.ple.prepare_cuda_graph_replay(batch)
 
+    def prepare_spec_graph_capture(self, token_count: int) -> None:
+        """Size the PLE spec-verify buffers before the spec graph capture (separate
+        from the decode prep: the spec graph stages its own ngram buffer and the
+        conv-input stash)."""
+        for layer in self.layers.op_list:
+            if hasattr(layer, "ple"):
+                layer.ple.prepare_spec_graph_capture(token_count)
+
+    def prepare_spec_graph_replay(self, batch: "Batch") -> None:
+        """Host half of the PLE spec-verify step before the spec graph replays
+        (stages the ngram rows from the current hist; see Qwen4PleLayer)."""
+        for layer in self.layers.op_list:
+            if hasattr(layer, "ple"):
+                layer.ple.prepare_spec_graph_replay(batch)
+
+    def ple_spec_stash(self) -> dict:
+        """The graph-path PLE conv-input stash (layer_id -> buffer) for the spec
+        verify batch to consume at drain time."""
+        return {
+            layer.ple._layer_id: layer.ple._spec_conv_buf
+            for layer in self.layers.op_list
+            if hasattr(layer, "ple")
+        }
+
+    def ple_spec_snapshot(self, reqs) -> None:
+        """Snapshot the spec batch's PLE state rows before the verify forward
+        over-advances them (scheduler _forward hook)."""
+        slots = [
+            int(r.linear_slot_idx if r.linear_slot_idx is not None else r.table_idx)
+            for r in reqs
+        ]
+        for layer in self.layers.op_list:
+            if hasattr(layer, "ple"):
+                layer.ple.spec_snapshot(slots)
+
+    def ple_spec_commit(self, req, m: int, committed_ids) -> None:
+        """Exact post-commit correction of the PLE hist/last-eos (scheduler drain
+        hook, every non-finished spec commit).
+
+        The slide is the seated rows this commit confirmed: [t at m] + the
+        accepted drafts. The drain's committed_ids (accepted + bonus, positions
+        m+1..m+len) is lagged one: the bonus at m+len is the NEXT forward's row
+        0, so hist must end at m+len-1 -- i.e. (stream[p-2], stream[p-1]) for
+        the next verify seated at p. req.input_ids[m] is still t (the appends
+        land at m+1..). Same rows the conv readvance re-lands ([0, committed)
+        of the stash), so the two state families stay in lockstep."""
+        slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+        slid = [int(req.input_ids[m])] + list(committed_ids[:-1])
+        for layer in self.layers.op_list:
+            if hasattr(layer, "ple"):
+                layer.ple.spec_commit(int(slot), m, slid)
+
+    def ple_spec_readvance(self, stash: dict, start: int, committed: int, slot: int) -> None:
+        """Re-land the PLE conv window at m+committed on a partial accept
+        (Scheduler._replay_spec_states; mirrors readvance_gdn_states)."""
+        for layer in self.layers.op_list:
+            ple = getattr(layer, "ple", None)
+            if ple is not None and ple._layer_id in stash:
+                ple.spec_readvance(stash[ple._layer_id], start, committed, slot)
+
     def readvance_gdn_states(self, stash: dict, start: int, rows: int, slot: int,
                              device: torch.device,
                              graph_consts: tuple | None = None) -> None:
@@ -224,6 +284,26 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def prepare_cuda_graph_replay(self, batch: "Batch") -> None:
         self.model.prepare_cuda_graph_replay(batch)
+
+    def prepare_spec_graph_capture(self, token_count: int) -> None:
+        """Delegate to the backbone (spec-verify graph PLE prep)."""
+        self.model.prepare_spec_graph_capture(token_count)
+
+    def prepare_spec_graph_replay(self, batch: "Batch") -> None:
+        """Delegate to the backbone (spec-verify graph PLE replay prep)."""
+        self.model.prepare_spec_graph_replay(batch)
+
+    def ple_spec_stash(self) -> dict:
+        return self.model.ple_spec_stash()
+
+    def ple_spec_snapshot(self, reqs) -> None:
+        self.model.ple_spec_snapshot(reqs)
+
+    def ple_spec_commit(self, req, m: int, committed_ids) -> None:
+        self.model.ple_spec_commit(req, m, committed_ids)
+
+    def ple_spec_readvance(self, stash: dict, start: int, committed: int, slot: int) -> None:
+        self.model.ple_spec_readvance(stash, start, committed, slot)
 
     def readvance_gdn_states(self, stash: dict, start: int, rows: int, slot: int,
                              device: torch.device,

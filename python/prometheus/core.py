@@ -156,6 +156,11 @@ class Batch:
     # accept can re-advance the state over the accepted rows without replaying a full
     # model forward (Scheduler._replay_spec_states). None on every other batch.
     spec_gdn_stash: dict | None = field(default=None, init=False)
+    # Spec-verify PLE rollback stash (qwen4_exp PLE layer): layer_id -> the verify
+    # span's conv inputs [1+k rows, hc_dim], written during the forward so a partial
+    # accept can re-land the conv window over the committed rows only
+    # (Scheduler._replay_spec_states). None on every other batch / model.
+    spec_ple_stash: dict | None = field(default=None, init=False)
     # True only for the static dummy batch while CUDA graphs are captured. Models
     # with host-prepared inputs use this to bind stable device buffers into the graph.
     cuda_graph_capture: bool = field(default=False, init=False)

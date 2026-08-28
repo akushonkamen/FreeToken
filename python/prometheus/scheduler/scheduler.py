@@ -412,6 +412,16 @@ class Scheduler(SchedulerIOMixin):
                     spec_reply, spec_finished, spec_replay = self._verify_spec_draft(
                         req, preds, batch.spec_drafts[i]
                     )
+                    ple_commit = getattr(self.engine.model, "ple_spec_commit", None)
+                    if not spec_finished and ple_commit is not None:
+                        # Exact PLE hist/last-eos correction for the committed
+                        # prefix: the verify forward slid the window by the full
+                        # 1+k draft rows (eager) or not at all (graph path) --
+                        # either way re-land it at m+committed from the committed
+                        # ids, i.e. exactly the equivalent decode steps' state.
+                        ple_commit(
+                            req, spec_m, [r.next_token for r in spec_reply]
+                        )
                     reply.extend(spec_reply)
                     self._spec_steps += 1
                     self._spec_committed += len(spec_reply)
@@ -692,6 +702,8 @@ class Scheduler(SchedulerIOMixin):
         for req, draft in zip(batch.reqs, batch.spec_drafts or []):
             offsets[req.uid] = off
             off += len(draft) + 1
+        ple_stash = batch.spec_ple_stash
+        ple_readvance = getattr(self.engine.model, "ple_spec_readvance", None)
         with self.engine_stream_ctx:
             for req, _, committed in replays:
                 if use_graph and 1 <= committed <= gr.rechain.max_rows:
@@ -704,6 +716,12 @@ class Scheduler(SchedulerIOMixin):
                     snapshots.restore(req)
                     readvance(stash, offsets[req.uid], committed,
                               snapshots.slot(req), self.device)
+                if ple_stash is not None and ple_readvance is not None:
+                    # qwen4_exp PLE: re-land the conv-input window over the
+                    # committed rows too (same offsets, same invariant).
+                    slot = (req.linear_slot_idx
+                            if req.linear_slot_idx is not None else req.table_idx)
+                    ple_readvance(ple_stash, offsets[req.uid], committed, int(slot))
 
     def _verify_spec_draft(
         self, req: Req, preds: List[int], draft: List[int]
@@ -1254,6 +1272,13 @@ class Scheduler(SchedulerIOMixin):
             # here on the engine stream, program-ordered before the forward's
             # in-place state updates.
             self.spec_state_snapshots.snapshot(batch.reqs)
+        ple_snap = getattr(self.engine.model, "ple_spec_snapshot", None)
+        if batch.spec_verify and ple_snap is not None:
+            # qwen4_exp PLE state rides the same rollback: snapshot hist/last-eos/
+            # conv window before the verify forward over-advances them (the drain
+            # corrects hist exactly per commit; _replay_spec_states re-lands the
+            # conv window on partial accepts).
+            ple_snap(batch.reqs)
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)

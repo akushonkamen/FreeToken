@@ -136,6 +136,10 @@ class SpecGraph:
     # (BT = min(CHUNK_SIZE, max(16, next_pow2(T)) ) -- 16 for ext < 16) and resolves a
     # SEPARATE tensor_cache'd index table for that BT. Same eviction hazard, same pin.
     fla_chunk_indices_o: torch.Tensor | None = None
+    # qwen4_exp PLE conv-input stash (layer_id -> buffer): the captured conv
+    # writeback advances the state over all 1+k rows, so the drain's partial-accept
+    # rollback re-lands it from these rows (mirrors `stash` for the GDN).
+    ple_stash: dict | None = None
 
 
 @dataclass
@@ -401,6 +405,17 @@ class GraphRunner:
         )
         cap.prefix_lens.fill_(fake_cached)
 
+        # qwen4_exp PLE: the spec-verify rows must ride the graph-safe branches --
+        # the eager prefill branches host-sync on cu_seqlens (cu.cpu()) and abort
+        # the capture. Flag the batch and size the model's persistent buffers
+        # BEFORE the warmup run, so _ngram_embeddings/_conv_forward read only the
+        # staged buffers inside the captured region.
+        batch.cuda_graph_capture = True
+        model.prepare_cuda_graph_capture(batch)
+        spec_capture_prep = getattr(model, "prepare_spec_graph_capture", None)
+        if spec_capture_prep is not None:
+            spec_capture_prep(ext)
+
         torch.cuda.synchronize(self.device)
         logger.info_rank0(f"Capturing spec-verify CUDA graph (ext={ext})")
         with ctx.forward_batch(batch):
@@ -414,6 +429,8 @@ class GraphRunner:
                 cap.next_tokens.copy_(torch.argmax(logits, dim=-1).to(torch.int32))
         cap.hidden_states = batch.hidden_states
         cap.stash = batch.spec_gdn_stash
+        ple_stash_fn = getattr(model, "ple_spec_stash", None)
+        cap.ple_stash = ple_stash_fn() if ple_stash_fn is not None else None
         cap.fla_metadata = batch.fla_metadata
         cap.attn_metadata = batch.attn_metadata
         self.spec = cap
@@ -555,11 +572,18 @@ class GraphRunner:
         s.prefix_lens[0].fill_(req.cached_len)
         slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
         s.fla_cache_idx[0].fill_(slot)
+        # qwen4_exp PLE: stage the verify rows' ngram embeddings from the current
+        # hist (host gather) before the replay reads the staged buffer.
+        spec_replay_prep = getattr(self.model, "prepare_spec_graph_replay", None)
+        if spec_replay_prep is not None:
+            spec_replay_prep(batch)
         s.graph.replay()
         if s.hidden_states is not None:
             batch.hidden_states = s.hidden_states
         if s.stash is not None:
             batch.spec_gdn_stash = s.stash
+        if s.ple_stash is not None:
+            batch.spec_ple_stash = s.ple_stash
         return s.next_tokens
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
