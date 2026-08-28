@@ -118,6 +118,9 @@ class Qwen4PleEmbedding(BaseOP):
         self._divisor = args.ngram_divisor
         self._table: torch.Tensor | None = None  # pinned host bf16 [padded, head_dim]
         self._gpu: dict | None = None  # {mult, vocab, offsets} device-side consts
+        # CUDA-graph staging: the captured decode reads the host-gathered ngram rows
+        # from this stable device buffer; it is filled eagerly before each replay.
+        self._graph_output: torch.Tensor | None = None
 
     def padded_vocab(self) -> int:
         # HF: offsets are cumulative head start rows, so total = last offset + last
@@ -213,6 +216,21 @@ class Qwen4PleEmbedding(BaseOP):
         emb = self._table.index_select(0, cpu_ids).view(ids.shape[0], -1)
         return emb.to(s0.device, non_blocking=False)
 
+    def prepare_cuda_graph_capture(self, token_count: int, device: torch.device) -> None:
+        if self._graph_output is None or self._graph_output.shape[0] < token_count:
+            self._graph_output = torch.zeros(
+                token_count, self._ngram_heads * self._head_dim,
+                device=device, dtype=torch.bfloat16,
+            )
+
+    def stage_graph_output(self, s0: torch.Tensor, s1: torch.Tensor, s2: torch.Tensor) -> None:
+        """Eagerly run the host-side ngram gather into the stable graph buffer."""
+        assert self._graph_output is not None, "stage before prepare_cuda_graph_capture"
+        ids = self._head_ids(s0, s1, s2)  # [N, ngram_heads] int64
+        cpu_ids = ids.reshape(-1).cpu()
+        emb = self._table.index_select(0, cpu_ids).view(ids.shape[0], -1)
+        self._graph_output[: emb.shape[0]].copy_(emb)
+
 
 class Qwen4PleLayer(BaseOP):
     """Per-Layer Embedding (HF ``Qwen4ExpTextPLELayer``) for the serving engine.
@@ -253,6 +271,36 @@ class Qwen4PleLayer(BaseOP):
 
     def prepare(self, device: torch.device) -> None:
         self.ple_embedding.prepare(device)
+
+    def prepare_cuda_graph_capture(self, token_count: int) -> None:
+        """Size the graph-owned state before decode capture: the embedding staging
+        buffer plus the hist/eos/conv pools. Replay writes real slot ids into the
+        graph's static index buffer, so the pools must cover every live slot."""
+        device = self.conv1d.weight.device
+        self.ple_embedding.prepare_cuda_graph_capture(token_count, device)
+        pool = get_global_ctx().linear_state_pool
+        self._ensure_slots(pool.num_slots if pool is not None else token_count, device)
+
+    def prepare_cuda_graph_replay(self, batch) -> None:
+        """Host half of the PLE decode step, run eagerly before graph replay: the
+        ngram lookup (device hash -> cpu gather -> staging buffer) and the hist /
+        last-eos window slide. The captured graph reads only the staged buffer and
+        the conv state pool."""
+        slots = batch.linear_table_idx
+        assert slots is not None
+        slots = slots.to(torch.int64)
+        ids = batch.input_ids.reshape(-1).to(torch.int64)
+        pos = batch.positions.reshape(-1).to(torch.int64)
+        hist = self._hist[slots]
+        le = self._last_eos[slots]
+        sp = pos - le - 1
+        s0 = ids
+        s1 = torch.where(sp >= 1, hist[:, 1], ids.new_full((), self._eos))
+        s2 = torch.where(sp >= 2, hist[:, 0], ids.new_full((), self._eos))
+        self.ple_embedding.stage_graph_output(s0, s1, s2)
+        self._hist[slots, 0] = hist[:, 1]
+        self._hist[slots, 1] = s0
+        self._last_eos[slots] = torch.where(s0 == self._eos, pos, le)
 
     def _ensure_slots(self, n: int, device) -> None:
         if self._hist is not None and self._hist.shape[0] >= n:
@@ -295,6 +343,12 @@ class Qwen4PleLayer(BaseOP):
         """ids: flat [T] int64 for this forward. Returns [T, ple_embed_dim]."""
         emb = self.ple_embedding
         if batch.is_decode:
+            if batch.cuda_graph_capture:
+                # Graph decode: the ngram rows were staged eagerly (replay prep
+                # also slid the hist window); capture only reads the buffer.
+                out = emb._graph_output
+                assert out is not None
+                return out[: ids.shape[0]]
             slots = fla.cache_indices.to(torch.int64)
             self._ensure_slots(int(slots.max()) + 1, ids.device)
             hist = self._hist[slots]  # [B, 2]

@@ -21,6 +21,7 @@ from ..qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
 from ..qwen3_5_moe.moe import Qwen3_5MoE
 
 if TYPE_CHECKING:
+    from prometheus.core import Batch
     from prometheus.models.config import ModelConfig
 
 
@@ -158,6 +159,16 @@ class Qwen4ExpModel(BaseOP):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.hyper_connection_mixer.forward(self.forward_hidden(input_ids))
 
+    def prepare_cuda_graph_capture(self, token_count: int) -> None:
+        for layer in self.layers.op_list:
+            if hasattr(layer, "ple"):
+                layer.ple.prepare_cuda_graph_capture(token_count)
+
+    def prepare_cuda_graph_replay(self, batch: "Batch") -> None:
+        for layer in self.layers.op_list:
+            if hasattr(layer, "ple"):
+                layer.ple.prepare_cuda_graph_replay(batch)
+
     def readvance_gdn_states(self, stash: dict, start: int, rows: int, slot: int,
                              device: torch.device,
                              graph_consts: tuple | None = None) -> None:
@@ -207,6 +218,12 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             # time, outside the forward ctx -- NOT the post-mixer mixed hidden.
             batch.hidden_states = x
         return self.lm_head.forward(self.model.hyper_connection_mixer.forward(x))
+
+    def prepare_cuda_graph_capture(self, batch: "Batch") -> None:
+        self.model.prepare_cuda_graph_capture(batch.input_ids.numel())
+
+    def prepare_cuda_graph_replay(self, batch: "Batch") -> None:
+        self.model.prepare_cuda_graph_replay(batch)
 
     def readvance_gdn_states(self, stash: dict, start: int, rows: int, slot: int,
                              device: torch.device,
