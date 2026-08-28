@@ -348,7 +348,17 @@ class Qwen4PleLayer(BaseOP):
         the post-commit correction (spec_commit, from the committed ids)."""
         ids = batch.input_ids.reshape(-1).to(torch.int64)
         L = ids.shape[0]
-        slots = batch.fla_metadata.cache_indices.to(torch.int64)
+        # fla_metadata is still None here: the FLA op builds it lazily inside the
+        # (captured) forward, so derive the slot the same way replay_spec fills
+        # s.fla_cache_idx -- the spec graph is bs=1 (can_use_spec_graph).
+        slots = torch.tensor(
+            [
+                r.linear_slot_idx if r.linear_slot_idx is not None else r.table_idx
+                for r in batch.reqs
+            ],
+            dtype=torch.int64,
+            device=ids.device,
+        )
         hist = self._hist[slots]   # [1, 2]
         win = torch.cat([hist.reshape(-1), ids])  # [2 + L]
         # Shifted views with HF's exact windowed segment logic (see the eager
