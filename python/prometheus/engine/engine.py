@@ -294,6 +294,11 @@ class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        if os.getenv("PROM_PTRACER") == "1":
+            import ctypes
+            # allow cuda-gdb attach despite ptrace_scope=1 (PR_SET_PTRACER, ANY)
+            ctypes.CDLL(None, use_errno=True).prctl(0x59616D61, 0xFFFFFFFF)
+            logger.info_rank0("PR_SET_PTRACER_ANY set")
         _ensure_expandable_segments()  # before the first CUDA allocation below
 
         from prometheus.gpu_select import bind_assigned_gpu

@@ -117,6 +117,11 @@ def set_tensor_cache_pinning(enabled: bool) -> None:
     warmup run) is in flight; see _tensor_cache_pins above."""
     global _tensor_cache_pinning
     _tensor_cache_pinning = enabled
+    # Capture-phase bracket: keep the W8A8 GEMM dispatch on its graph-safe path
+    # for the warmup forward too, so the triton GEMM is JIT-compiled before the
+    # stream capture begins (see fp8_pertensor_linear).
+    from prometheus.kernel.triton.fp8_pertensor_linear import set_graph_capture_phase
+    set_graph_capture_phase(enabled)
 
 
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:

@@ -249,6 +249,18 @@ def _scaled_mm(
     )
 
 
+# Set by the engine around every graph-capture warmup+capture region (via
+# set_tensor_cache_pinning, which brackets all capture sites). The warmup must
+# take the same GEMM path the capture will: the graph-safe triton GEMM JIT-
+# compiles on first invocation, and that must happen outside stream capture.
+_GRAPH_CAPTURE_PHASE = False
+
+
+def set_graph_capture_phase(on: bool) -> None:
+    global _GRAPH_CAPTURE_PHASE
+    _GRAPH_CAPTURE_PHASE = on
+
+
 def fp8_pertensor_linear(
     x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
@@ -269,7 +281,26 @@ def fp8_pertensor_linear(
     if _USE_REF:  # numeric-reference fallback (debug / A-B)
         w = weight.to(x.dtype) * weight_scale.to(x.dtype)[:, None]
         out = (x.reshape(-1, K) @ w.t()).reshape(*lead, N)
-    elif input_scale is not None and e4m3_native():
+    elif (
+        input_scale is not None
+        and e4m3_native()
+        # torch._scaled_mm lowers to a CUTLASS sm89 StreamK kernel whose tile
+        # scheduler spin-waits on a global-memory barrier across its workers.
+        # Captured into a CUDA graph, the replay can deadlock (all SMs busy,
+        # zero memory traffic) once any allocator/stream activity precedes the
+        # replay -- observed on RTX 4090 with bs>=5 decode graphs. Fall back to
+        # the graph-safe triton GEMM for whatever gets captured; eager calls
+        # keep the fast cuBLASLt path. (PROM_FP8_GEMM_IN_GRAPH=0 disables.)
+        and not (
+            (_GRAPH_CAPTURE_PHASE or torch.cuda.is_current_stream_capturing())
+            and os.getenv("PROM_FP8_GEMM_IN_GRAPH", "1") != "0"
+        )
+        # PROM_FP8_FORCE_TRITON=1 additionally bans the eager path: the same
+        # StreamK scheduler wedged (spin, host blocked in a prefill-overlap
+        # sync) under the multi-stream overlap scheduler at C>=16 even outside
+        # graphs -- offload_cache._invalidate_prefill_buffer py-spy evidence.
+        and os.getenv("PROM_FP8_FORCE_TRITON") != "1"
+    ):
         out = _scaled_mm(
             x.reshape(-1, K), weight, weight_scale, input_scale, uniform_scale, x.dtype,
         ).reshape(*lead, N)
