@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List
 
@@ -205,6 +206,22 @@ def _determine_cuda_graph_bs(
 
     if cuda_graph_max_bs < 1:
         return []
+
+    # PROM_GRAPH_SIZES (comma-separated ints, e.g. "1,8,32") overrides the default
+    # capture ladder below. Invalid/nonpositive entries are dropped, duplicates
+    # removed, and the result is sorted descending. Sizes above the effective
+    # cuda_graph_max_bs are dropped (mirroring the default ladder's clamp).
+    env_sizes = os.getenv("PROM_GRAPH_SIZES")
+    if env_sizes:
+        sizes = set()
+        for part in env_sizes.split(","):
+            try:
+                bs = int(part.strip())
+            except ValueError:
+                continue
+            if bs > 0:
+                sizes.add(bs)
+        return sorted((bs for bs in sizes if bs <= cuda_graph_max_bs), reverse=True)
 
     candidates = [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
     return [bs for bs in candidates if bs <= cuda_graph_max_bs]
