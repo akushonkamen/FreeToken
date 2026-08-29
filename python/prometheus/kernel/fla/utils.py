@@ -9,7 +9,7 @@ import os
 import sys
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Callable, Dict, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import torch
 import triton
@@ -100,6 +100,24 @@ def assert_close(prefix, ref, tri, ratio, warning=False, err_atol=1e-6):
 
 SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
 
+# CUDA-graph capture pins. Captured kernels bake tensor ADDRESSES: a chunk table
+# served from the LRU below is read by pointer inside the graph, so the cache is
+# then the tensor's only owner. A later eviction (the cache churns whenever eager
+# paths pass freshly built cu_seqlens tensors) drops that last reference -- with
+# expandable_segments enabled the freed block is unmapped and the next graph
+# replay faults with an illegal memory access. While capture pinning is on, every
+# result handed out (hit or miss) is appended to a module-level pin list so the
+# tensors outlive every graph that baked them.
+_tensor_cache_pins: List[Any] = []
+_tensor_cache_pinning = False
+
+
+def set_tensor_cache_pinning(enabled: bool) -> None:
+    """Strong-pin every tensor_cache result while a CUDA graph capture (or its
+    warmup run) is in flight; see _tensor_cache_pins above."""
+    global _tensor_cache_pinning
+    _tensor_cache_pinning = enabled
+
 
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     """
@@ -131,6 +149,8 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
                         + cache_entries[i + 1 :]
                         + [(args, kwargs, last_result)]
                     )
+                    if _tensor_cache_pinning:
+                        _tensor_cache_pins.append(last_result)
                     return last_result
 
         result = fn(*args, **kwargs)
@@ -138,6 +158,8 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
         if len(cache_entries) >= cache_size:
             cache_entries = cache_entries[1:]
         cache_entries.append((args, kwargs, result))
+        if _tensor_cache_pinning:
+            _tensor_cache_pins.append(result)
         return result
 
     return wrapper

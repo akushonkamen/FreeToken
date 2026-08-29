@@ -446,6 +446,10 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             spec_ext=(1 + config.spec_mtp) if getattr(config, "spec_mtp", 0) > 0 else None,
+            spec_max_bs=(
+                int(__import__("os").getenv("PROM_SPEC_MAX_BS", "0"))
+                or max(1, config.max_running_req)
+            ),
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -898,6 +902,10 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             spec_ext=(1 + config.spec_mtp) if getattr(config, "spec_mtp", 0) > 0 else None,
+            spec_max_bs=(
+                int(__import__("os").getenv("PROM_SPEC_MAX_BS", "0"))
+                or max(1, config.max_running_req)
+            ),
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:

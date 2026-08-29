@@ -229,6 +229,7 @@ class GraphRunner:
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
         spec_ext: int | None = None,
+        spec_max_bs: int = 1,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -245,7 +246,8 @@ class GraphRunner:
         self.device = device
         self.max_seq_len = max_seq_len
         self._graph_pool = None
-        self.spec: SpecGraph | None = None
+        self.spec_graphs: dict[int, SpecGraph] = {}
+        self.spec_max_bs = max(1, spec_max_bs)
         self.rechain: RechainGraph | None = None
         self._capture_graphs(max_seq_len, vocab_size, model)
         if spec_ext is not None and self.max_graph_bs > 0:
@@ -304,13 +306,21 @@ class GraphRunner:
                           if self.dummy_req.linear_slot_idx is not None
                           else self.dummy_req.table_idx)
             self.buffer.table_idx[:bs].fill_(dummy_slot)
-            with get_global_ctx().forward_batch(batch):
-                self.buffer.logits[:bs] = model.forward()
-                # Keep the offload cache warmed for capture. Resetting here forces
-                # CUDA graph capture to replay cold-cache expert copies.
-                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+            # Pin tensor_cache results from the warmup+capture forwards: the graph
+            # bakes their addresses and the LRU(4) cache is otherwise their only
+            # owner (eviction -> free -> expandable-segments unmap -> replay fault).
+            from prometheus.kernel.fla.utils import set_tensor_cache_pinning
+            set_tensor_cache_pinning(True)
+            try:
+                with get_global_ctx().forward_batch(batch):
                     self.buffer.logits[:bs] = model.forward()
-                self._reset_moe_offload_cache()
+                    # Keep the offload cache warmed for capture. Resetting here forces
+                    # CUDA graph capture to replay cold-cache expert copies.
+                    with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                        self.buffer.logits[:bs] = model.forward()
+                    self._reset_moe_offload_cache()
+            finally:
+                set_tensor_cache_pinning(False)
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
@@ -321,65 +331,80 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def _capture_spec_graph(self, model: BaseLLMModel, vocab_size: int, spec_ext: int) -> None:
-        """Capture the fixed-shape spec-verify forward (see SpecGraph). Runs after the
-        decode captures so it can share their memory pool; uses the triton spec backend
-        (ctx.spec_attn_backend) that spec-verify batches are routed to."""
+        """Capture one spec-verify graph per batch size 1..spec_max_bs (see SpecGraph).
+        Runs after the decode captures so it can share their memory pool; uses the
+        triton spec backend (ctx.spec_attn_backend) that spec-verify batches are
+        routed to. Uniform-ext batches of size bs replay the bs graph; mixed-ext or
+        oversized batches run eager."""
+        for bs in range(1, self.spec_max_bs + 1):
+            self._capture_one_spec(model, spec_ext, bs)
+
+    def _capture_one_spec(self, model: BaseLLMModel, spec_ext: int, bs: int) -> None:
+        """Capture the fixed-shape spec-verify forward for one batch size: bs requests
+        each with the full 1+k draft seated (rows = bs * ext). Every kernel shape is a
+        capture constant -- the uniform per-request row count makes cu_seqlens and the
+        total row count fixed; only buffer CONTENTS vary per replay."""
         from prometheus.attention.linear import FLAMetadata
         from prometheus.attention.triton import TritonMetadata
 
         ctx = get_global_ctx()
         assert ctx.spec_attn_backend is not None, "spec graph requires the spec attn backend"
         device, ext = self.device, spec_ext
+        rows = bs * ext
         dummy = self.dummy_req
         cap = SpecGraph(
             ext=ext,
             graph=torch.cuda.CUDAGraph(),
-            input_ids=torch.zeros(ext, dtype=torch.int32, device=device),
-            positions=torch.arange(ext, dtype=torch.int32, device=device),
-            out_loc=torch.zeros(ext, dtype=torch.int32, device=device),
-            next_tokens=torch.zeros(ext, dtype=torch.int32, device=device),
-            kv_indices=torch.zeros(self.max_seq_len, dtype=torch.int32, device=device),
-            kv_indptr=torch.tensor([0, ext], dtype=torch.int32, device=device),
-            prefix_lens=torch.zeros(1, dtype=torch.int32, device=device),
-            fla_cache_idx=torch.zeros(1, dtype=torch.int32, device=device),
+            input_ids=torch.zeros(rows, dtype=torch.int32, device=device),
+            positions=torch.arange(rows, dtype=torch.int32, device=device),
+            out_loc=torch.zeros(rows, dtype=torch.int32, device=device),
+            next_tokens=torch.zeros(rows, dtype=torch.int32, device=device),
+            kv_indices=torch.zeros(bs * self.max_seq_len, dtype=torch.int32, device=device),
+            kv_indptr=torch.zeros(bs + 1, dtype=torch.int32, device=device),
+            prefix_lens=torch.zeros(bs, dtype=torch.int32, device=device),
+            fla_cache_idx=torch.zeros(bs, dtype=torch.int32, device=device),
         )
         # Capture-time scratch pointers: KV/out_loc slot 0 and the GDN padding slot are
         # written/read during the warmup + capture forwards only (mirrors the decode
         # capture's zero out_loc); every real replay overwrites them via replay_spec.
-        cap.kv_indices[:ext].zero_()
+        cap.kv_indices[:rows].zero_()
 
-        # A fake continuing request: cached_len > 0 so the GDN span carries state
+        # Fake continuing requests: cached_len > 0 so the GDN span carries state
         # (has_initial_state=True) exactly like a real mid-generation verify step.
         # cached_len must stay < ext (the Req ctor asserts cached_len < len(input_ids)),
         # so small-k captures fall back to a 1-token history.
         fake_cached = 4 if ext > 4 else 1
-        fake = Req(
-            input_ids=torch.zeros(ext, dtype=torch.int32, device="cpu"),
-            table_idx=dummy.table_idx,
-            cached_len=fake_cached,
-            output_len=ext + 8,
-            uid=-1,
-            sampling_params=None,  # type: ignore[arg-type]
-            cache_handle=None,  # type: ignore[arg-type]
-        )
-        fake.linear_slot_idx = dummy.linear_slot_idx
-        fake.device_len = fake_cached + ext
-        batch = Batch(reqs=[fake], phase="prefill", spec_verify=True)
+        fakes = []
+        for _ in range(bs):
+            fake = Req(
+                input_ids=torch.zeros(ext, dtype=torch.int32, device="cpu"),
+                table_idx=dummy.table_idx,
+                cached_len=fake_cached,
+                output_len=ext + 8,
+                uid=-1,
+                sampling_params=None,  # type: ignore[arg-type]
+                cache_handle=None,  # type: ignore[arg-type]
+            )
+            fake.linear_slot_idx = dummy.linear_slot_idx
+            fake.device_len = fake_cached + ext
+            fakes.append(fake)
+        batch = Batch(reqs=fakes, phase="prefill", spec_verify=True)
         batch.padded_reqs = batch.reqs
-        batch.spec_drafts = [[0] * (ext - 1)]
+        batch.spec_drafts = [[0] * (ext - 1) for _ in range(bs)]
         batch.input_ids = cap.input_ids
         batch.positions = cap.positions
         batch.out_loc = cap.out_loc
         batch.return_hidden = True
-        batch.forward_row_lens = [ext]
-        # FLA metadata over persistent buffers: cu is a constant, the slot is a buffer.
+        batch.forward_row_lens = [ext] * bs
+        # FLA metadata over persistent buffers: cu is a constant (uniform ext), the
+        # per-request slots are a buffer.
         cap.fla_cache_idx.fill_(dummy.linear_slot_idx
                                 if dummy.linear_slot_idx is not None else dummy.table_idx)
-        fla_cu = torch.tensor([0, ext], dtype=torch.int64, device=device)
+        fla_cu = torch.arange(0, rows + 1, ext, dtype=torch.int64, device=device)
         batch.fla_metadata = FLAMetadata(
             cu_seqlens=fla_cu,
             cache_indices=cap.fla_cache_idx,
-            has_initial_state=torch.tensor([True], dtype=torch.bool, device=device),
+            has_initial_state=torch.tensor([True] * bs, dtype=torch.bool, device=device),
         )
         # Pin the tensor_cache'd chunk-index table (see SpecGraph.fla_chunk_indices):
         # resolve it here so the warmup/capture below hit the same cached tensor.
@@ -394,16 +419,18 @@ class GraphRunner:
         if bt_o != CHUNK_SIZE:
             cap.fla_chunk_indices_o = prepare_chunk_indices(fla_cu, bt_o)
         batch.attn_metadata = TritonMetadata(
-            cu_seqlens_q_gpu=torch.tensor([0, ext], dtype=torch.int32, device=device),
+            cu_seqlens_q_gpu=fla_cu.to(torch.int32),
             indptr=cap.kv_indptr,
             indices=cap.kv_indices,
-            q_to_req=torch.zeros(ext, dtype=torch.int32, device=device),    # extend path: unused
-            q_positions=torch.zeros(ext, dtype=torch.int64, device=device),  # extend path: unused
+            q_to_req=torch.zeros(rows, dtype=torch.int32, device=device),    # extend path: unused
+            q_positions=torch.zeros(rows, dtype=torch.int64, device=device),  # extend path: unused
             is_decode=False,
             prefix_lens=cap.prefix_lens,
             max_q_len=ext,
         )
         cap.prefix_lens.fill_(fake_cached)
+        n_fake = fake_cached + ext
+        cap.kv_indptr.copy_(torch.arange(0, (n_fake) * (bs + 1), n_fake, dtype=torch.int32))
 
         # qwen4_exp PLE: the spec-verify rows must ride the graph-safe branches --
         # the eager prefill branches host-sync on cu_seqlens (cu.cpu()) and abort
@@ -425,23 +452,31 @@ class GraphRunner:
             spec_capture_prep(ext)
 
         torch.cuda.synchronize(self.device)
-        logger.info_rank0(f"Capturing spec-verify CUDA graph (ext={ext})")
-        with ctx.forward_batch(batch):
-            # Warmup run: settles triton autotune and populates the tensor_cache that
-            # memoizes prepare_chunk_indices' host read of the constant cu_seqlens --
-            # without it the capture itself would host-sync inside the graph region.
-            model.forward()
-            self._reset_moe_offload_cache()
-            with torch.cuda.graph(cap.graph, pool=self._graph_pool, stream=self.stream):
-                logits = model.forward()
-                cap.next_tokens.copy_(torch.argmax(logits, dim=-1).to(torch.int32))
+        logger.info_rank0(f"Capturing spec-verify CUDA graph (bs={bs}, ext={ext})")
+        # Pin tensor_cache results touched by the warmup+capture forwards: the graph
+        # bakes chunk-table addresses that the LRU(4) cache would otherwise be the
+        # sole owner of (see set_tensor_cache_pinning).
+        from prometheus.kernel.fla.utils import set_tensor_cache_pinning
+        set_tensor_cache_pinning(True)
+        try:
+            with ctx.forward_batch(batch):
+                # Warmup run: settles triton autotune and populates the tensor_cache that
+                # memoizes prepare_chunk_indices' host read of the constant cu_seqlens --
+                # without it the capture itself would host-sync inside the graph region.
+                model.forward()
+                self._reset_moe_offload_cache()
+                with torch.cuda.graph(cap.graph, pool=self._graph_pool, stream=self.stream):
+                    logits = model.forward()
+                    cap.next_tokens.copy_(torch.argmax(logits, dim=-1).to(torch.int32))
+        finally:
+            set_tensor_cache_pinning(False)
         cap.hidden_states = batch.hidden_states
         cap.stash = batch.spec_gdn_stash
         ple_stash_fn = getattr(model, "ple_spec_stash", None)
         cap.ple_stash = ple_stash_fn() if ple_stash_fn is not None else None
         cap.fla_metadata = batch.fla_metadata
         cap.attn_metadata = batch.attn_metadata
-        self.spec = cap
+        self.spec_graphs[bs] = cap
 
     def capture_rechain_graph(self, model: BaseLLMModel, max_rows: int,
                              snapshots: object) -> None:
@@ -519,11 +554,19 @@ class GraphRunner:
 
             torch.cuda.synchronize(device)
             logger.info_rank0(f"Capturing rechain CUDA graph (rows={rows})")
-            _restore_graph()
-            _rechain_graph()
-            with torch.cuda.graph(entry.graph, pool=self._graph_pool, stream=self.stream):
+            # Same tensor_cache pinning as the decode/spec captures (the explicit
+            # per-rows pins above cover the known tables; this guards any table the
+            # GDN kernels resolve on their own).
+            from prometheus.kernel.fla.utils import set_tensor_cache_pinning
+            set_tensor_cache_pinning(True)
+            try:
                 _restore_graph()
                 _rechain_graph()
+                with torch.cuda.graph(entry.graph, pool=self._graph_pool, stream=self.stream):
+                    _restore_graph()
+                    _rechain_graph()
+            finally:
+                set_tensor_cache_pinning(False)
 
             cap.entries[rows] = entry
 
@@ -552,40 +595,61 @@ class GraphRunner:
             e.a_bufs[lid].copy_(src_a[start : start + committed])
             e.b_bufs[lid].copy_(src_b[start : start + committed])
         e.graph.replay()
+        import os as _os
+        if _os.getenv("PROM_SPEC_SYNC"):
+            torch.cuda.synchronize(self.device)
 
     def can_use_spec_graph(self, batch: Batch) -> bool:
-        """bs=1 spec-verify batch with the full 1+k draft seated (the captured shape)."""
-        s = self.spec
+        """Spec-verify batch whose size has a captured graph and where every request
+        seats the full 1+k draft (the captured uniform-ext shape). Mixed-ext or
+        oversized batches return False and run the eager verify forward."""
+        s = self.spec_graphs.get(batch.size)
         return (
             s is not None
             and batch.spec_verify
-            and batch.size == 1
-            and batch.reqs[0].extend_len == s.ext
+            and all(r.extend_len == s.ext for r in batch.reqs)
         )
 
     def replay_spec(self, batch: Batch) -> torch.Tensor:
         """Fill the persistent spec buffers from the batch, replay the captured verify
         forward + argmax, and re-point the batch at the graph-pool hidden states / GDN
         stash so the scheduler drain consumes them exactly like the eager forward's."""
-        s = self.spec
+        s = self.spec_graphs.get(batch.size)
         assert s is not None and self.can_use_spec_graph(batch)
-        req = batch.reqs[0]
         s.input_ids.copy_(batch.input_ids)
         s.positions.copy_(batch.positions)
         s.out_loc.copy_(batch.out_loc)
         page_table = get_global_ctx().page_table
-        n = req.device_len
-        s.kv_indices[:n].copy_(page_table[req.table_idx, :n])
-        s.kv_indptr[1].fill_(n)
-        s.prefix_lens[0].fill_(req.cached_len)
-        slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
-        s.fla_cache_idx[0].fill_(slot)
+        off = 0
+        for i, req in enumerate(batch.reqs):
+            n = req.device_len
+            s.kv_indices[off : off + n].copy_(page_table[req.table_idx, :n])
+            off += n
+            s.kv_indptr[i + 1].fill_(off)
+            s.prefix_lens[i].fill_(req.cached_len)
+            slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+            s.fla_cache_idx[i].fill_(slot)
         # qwen4_exp PLE: stage the verify rows' ngram embeddings from the current
         # hist (host gather) before the replay reads the staged buffer.
         spec_replay_prep = getattr(self.model, "prepare_spec_graph_replay", None)
         if spec_replay_prep is not None:
             spec_replay_prep(batch)
+        import os as _os
+        if _os.getenv("PROM_SPEC_DBG"):
+            import sys as _sys
+            _kv = s.kv_indices[:off]
+            print(
+                f"[SPEC-DBG] bs={batch.size} off={off} numel={s.kv_indices.numel()} "
+                f"kvi=[{int(_kv.min())},{int(_kv.max())}] "
+                f"outloc=[{int(s.out_loc.min())},{int(s.out_loc.max())}] "
+                f"slots={s.fla_cache_idx.tolist()} "
+                f"indptr={s.kv_indptr.tolist()} prefix={s.prefix_lens.tolist()} "
+                f"pt={tuple(page_table.shape)}",
+                file=_sys.stderr, flush=True,
+            )
         s.graph.replay()
+        if _os.getenv("PROM_SPEC_SYNC"):
+            torch.cuda.synchronize(self.device)
         if s.hidden_states is not None:
             batch.hidden_states = s.hidden_states
         if s.stash is not None:
@@ -623,6 +687,6 @@ class GraphRunner:
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
         self.buffer = None
-        self.spec = None
+        self.spec_graphs = {}
         self.rechain = None
         gc.collect()
