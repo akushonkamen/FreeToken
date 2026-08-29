@@ -758,8 +758,27 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
+    def _ensure_plan_scratch(self, k: int) -> None:
+        # flashlib's lru_ensure validation requires the plan buffers to hold
+        # min(k, cache_size) entries. Decode batches with bs * topk > num_experts
+        # (e.g. bs=104, topk=8 -> k=832 vs 256 experts) overflow the
+        # num_experts-sized scratch. Grow once, on the first (largest) query --
+        # graph capture visits sizes in descending order, so this lands in the
+        # warmup before anything bakes a pointer. Retired buffers stay alive:
+        # earlier-captured graphs may still reference their addresses.
+        need = min(k, self.cache_size)
+        if self.src_indices.numel() < need:
+            retired = getattr(self, "_plan_scratch_retired", None)
+            if retired is None:
+                retired = self._plan_scratch_retired = []
+            retired.extend((self.src_indices, self.evict_slots))
+            self.src_indices = torch.empty((need,), dtype=torch.int32, device=self.device)
+            self.evict_slots = torch.empty((need,), dtype=torch.int32, device=self.device)
+
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from prometheus.moe.offload_kernels import ensure_experts
+
+        self._ensure_plan_scratch(expert_ids.numel())
 
         if self.collect_decode_freq:
             # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
@@ -785,6 +804,7 @@ class OffloadMoeCache:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
+        self._ensure_plan_scratch(expert_ids.numel())
         ensure_experts_hybrid(
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
