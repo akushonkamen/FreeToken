@@ -16,7 +16,7 @@ _HYBRID_FETCH_BY_RECENCY = (
 )
 
 
-def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor, verify: bool = False) -> None:
     """Make this layer's routed experts resident; rewrite ``expert_ids`` to slot ids.
 
     Delegates to flashlib's slot cache. ``id_base`` maps this layer's expert ids into the
@@ -35,7 +35,11 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         cache.src_indices,
         cache.evict_slots,
         cache.num_indices,
-        stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
+        stats=(
+            (cache.lru_stats_verify if verify else cache.lru_stats)[layer_id]
+            if cache.collect_stats
+            else None
+        ),
         id_base=layer_id * cache.num_experts,
     )
 

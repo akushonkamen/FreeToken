@@ -326,7 +326,11 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
-        cache.ensure_experts(self.layer_id, topk_ids)
+        cache.ensure_experts(
+            self.layer_id,
+            topk_ids,
+            verify=bool(getattr(get_global_ctx().batch, "spec_verify", False)),
+        )
         cache.copy_missing()
         return self._expert_gemm(
             cache,

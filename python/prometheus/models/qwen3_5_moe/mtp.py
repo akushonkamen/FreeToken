@@ -242,14 +242,84 @@ class MTPMLP(BaseOP):
         return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
 
 
+class MTPMoEExperts(BaseOP):
+    """The draft layer's routed experts, kept as the checkpoint's stacked bf16 tensors
+    (``gate_up_proj`` [E, 2I, H] / ``down_proj`` [E, H, I]; flat keys without a
+    ``.weight`` suffix -- the BaseOP walk loads plain tensor attrs under their own
+    names). Forward gathers the selected experts' matrices (index_select) and runs one
+    batched GEMM per projection over the B*k (token, expert) pairs."""
+
+    def __init__(self, num_experts: int, hidden_size: int, intermediate_size: int):
+        self.gate_up_proj = torch.empty(
+            num_experts, 2 * intermediate_size, hidden_size, dtype=torch.bfloat16
+        )
+        self.down_proj = torch.empty(
+            num_experts, hidden_size, intermediate_size, dtype=torch.bfloat16
+        )
+
+    def forward(self, x: torch.Tensor, top_idx: torch.Tensor, top_w: torch.Tensor) -> torch.Tensor:
+        B, k = top_idx.shape
+        H = x.shape[-1]
+        flat = top_idx.reshape(-1)
+        xs = x.unsqueeze(1).expand(B, k, H).reshape(B * k, 1, H)
+        out = torch.empty(B * k, H, dtype=x.dtype, device=x.device)
+        # The prefill seed feeds the whole prompt through the draft (P = L*k pairs);
+        # one fused index_select+bmm would materialize an L-proportional multi-GB
+        # weight temp. Chunk the pairs so the gather stays ~400 MB at any L.
+        step = 64
+        for s in range(0, B * k, step):
+            sl = slice(s, min(s + step, B * k))
+            idx = flat[sl]
+            gu = torch.bmm(xs[sl], self.gate_up_proj.index_select(0, idx).transpose(1, 2))
+            g, u = gu.chunk(2, dim=-1)
+            h = F.silu(g) * u
+            out[sl] = torch.bmm(
+                h, self.down_proj.index_select(0, idx).transpose(1, 2)
+            ).squeeze(1)
+        return (out.view(B, k, H) * top_w.unsqueeze(-1)).sum(dim=1)
+
+
+class MTPMoEMLP(BaseOP):
+    """Routed MoE MLP for the MoE draft layer: softmax -> top-k -> renormalize router
+    plus the gated shared expert (mirrors :class:`Qwen3_5MoE` semantics). The shared
+    expert reuses :class:`MTPMLP` (fused gate_up/down projections); the router and the
+    stacked routed experts are flat replicated linears / stacked tensors."""
+
+    def __init__(self, config: "ModelConfig"):
+        self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
+        self.experts = MTPMoEExperts(
+            config.num_experts, config.hidden_size, config.moe_intermediate_size
+        )
+        self.shared_expert = MTPMLP(
+            config.hidden_size, config.shared_expert_intermediate_size
+        )
+        self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
+        self._topk = config.num_experts_per_tok
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        routing = torch.softmax(self.gate.forward(x), dim=-1)
+        top_w, top_i = torch.topk(routing, self._topk, dim=-1)
+        top_w = top_w / top_w.sum(dim=-1, keepdim=True)
+        shared = self.shared_expert.forward(x) * torch.sigmoid(
+            self.shared_expert_gate.forward(x)
+        )
+        return self.experts.forward(x, top_i, top_w) + shared
+
+
 class MTPDecoderLayer(BaseOP):
     """Pre-norm block mirroring :class:`Qwen3_5DecoderLayer`'s full-attention branch
     (residual=None entry: the fc output is the first residual stream), with the
     draft attention and a dense SwiGLU MLP (the checkpoint's mtp layer is not MoE)."""
 
-    def __init__(self, config: "ModelConfig"):
+    def __init__(self, config: "ModelConfig", moe: bool = False):
         self.self_attn = MTPAttention(config, layer_id=0)
-        self.mlp = MTPMLP(config.hidden_size, config.intermediate_size)
+        # 35B checkpoints store the mtp layer as a MoE layer (256 routed experts +
+        # shared expert); the earlier dense checkpoints carry a plain SwiGLU MLP.
+        self.mlp = (
+            MTPMoEMLP(config)
+            if moe
+            else MTPMLP(config.hidden_size, config.intermediate_size)
+        )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -294,6 +364,7 @@ class MTPDraft(BaseOP):
         config: "ModelConfig",
         embed_tokens: "VocabParallelEmbedding",
         lm_head: "ParallelLMHead",
+        moe: bool = False,
     ):
         hidden = config.hidden_size
         self.hidden_size = hidden
@@ -302,7 +373,7 @@ class MTPDraft(BaseOP):
         self.fc = LinearReplicated(2 * hidden, hidden, has_bias=False)
         self.pre_fc_norm_embedding = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
         self.pre_fc_norm_hidden = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
-        self.layers = OPList([MTPDecoderLayer(config)])
+        self.layers = OPList([MTPDecoderLayer(config, moe=moe)])
         self.norm = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
         self._embed_tokens = embed_tokens
         # Draft argmax runs OUTSIDE forward_batch (no ctx.batch), so it cannot go through
@@ -310,9 +381,17 @@ class MTPDraft(BaseOP):
         # draft cost); keep an NVFP4 (W4A16) quantized copy for the DRAFT ONLY. A worse
         # argmax here just lowers acceptance -- the scheduler's greedy longest-prefix
         # verify still commits the target's own argmaxes, so outputs are unchanged.
-        _p, _s, self._lmq_global = _quantize_nvfp4_rowmajor(lm_head.weight)
-        # K-major resident layout: coalesced N-wide gemv loads
-        self._lmq_packed, self._lmq_scale = nvfp4_transpose_resident(_p, _s)
+        if hasattr(lm_head, "weight_global"):
+            # Quantized target head (Nvfp4LMHead): it already holds the exact NVFP4
+            # row-major resident layout argmax_next reads -- share its tensors by
+            # reference (no bf16 intermediate, no duplicate packed copy).
+            self._lmq_packed = lm_head.weight
+            self._lmq_scale = lm_head.weight_scale
+            self._lmq_global = lm_head.weight_global
+        else:
+            _p, _s, self._lmq_global = _quantize_nvfp4_rowmajor(lm_head.weight)
+            # K-major resident layout: coalesced N-wide gemv loads
+            self._lmq_packed, self._lmq_scale = nvfp4_transpose_resident(_p, _s)
 
     def forward_tokens(
         self,
@@ -372,8 +451,14 @@ class MTPDraft(BaseOP):
         attn, mlp = layer.self_attn, layer.mlp
         attn.qkv_proj = _Fp4LinearShim(attn.qkv_proj)
         attn.o_proj = _Fp4LinearShim(attn.o_proj)
-        mlp.gate_up_proj = _Fp4LinearShim(mlp.gate_up_proj)
-        mlp.down_proj = _Fp4LinearShim(mlp.down_proj)
+        if isinstance(mlp, MTPMoEMLP):
+            mlp.shared_expert.gate_up_proj = _Fp4LinearShim(mlp.shared_expert.gate_up_proj)
+            mlp.shared_expert.down_proj = _Fp4LinearShim(mlp.shared_expert.down_proj)
+            # The router and the 256 stacked routed experts stay bf16: the experts'
+            # gathered batched GEMM has no NVFP4 grouped kernel yet (~1.6 GB).
+        else:
+            mlp.gate_up_proj = _Fp4LinearShim(mlp.gate_up_proj)
+            mlp.down_proj = _Fp4LinearShim(mlp.down_proj)
         torch.cuda.empty_cache()
 
     def argmax_next(self, z: torch.Tensor) -> torch.Tensor:
@@ -408,6 +493,10 @@ _MTP_GEMMA_SUFFIXES = (
 _MTP_FUSIONS: dict[str, tuple[str, ...]] = {
     ".self_attn.qkv_proj": (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"),
     ".mlp.gate_up_proj": (".mlp.gate_proj", ".mlp.up_proj"),
+    ".mlp.shared_expert.gate_up_proj": (
+        ".mlp.shared_expert.gate_proj",
+        ".mlp.shared_expert.up_proj",
+    ),
 }
 
 
@@ -431,11 +520,15 @@ def load_mtp_state_dict(model_path: str, device: torch.device) -> Dict[str, torc
                 tensor = reader.get_tensor(name)
                 if any(name.endswith(s) for s in _MTP_GEMMA_SUFFIXES):
                     tensor = tensor + 1.0
-                emit = ct_bf16_fuse(name[len("mtp.") : -len(".weight")], tensor, fuse_buf, _MTP_FUSIONS)
-                if emit is None:  # not a fusion part: keep as-is (already has .weight)
-                    state[name[len("mtp.") :]] = tensor
-                else:
-                    state.update(emit)  # [] while buffered, [(key, cat)] once complete
+                short = name[len("mtp.") :]
+                if short.endswith(".weight"):
+                    emit = ct_bf16_fuse(short[: -len(".weight")], tensor, fuse_buf, _MTP_FUSIONS)
+                    if emit is None:  # not a fusion part: keep as-is (already has .weight)
+                        state[short] = tensor
+                    else:
+                        state.update(emit)  # [] while buffered, [(key, cat)] once complete
+                else:  # stacked routed experts (mlp.experts.*): flat key, no .weight
+                    state[short] = tensor
         assert not fuse_buf, f"Incomplete MTP projection fusions: {list(fuse_buf.keys())}"
     finally:
         reader.close()
@@ -497,8 +590,14 @@ class MTPDraftManager:
         # state has no fresh draft_t, and seat_drafts would fall the batch back to
         # a plain decode.
         self._rechain_pending: List[Tuple[int, int]] = []
+        # (uid, tokens[int32, L, dev], hiddens[L, hidden, dev]) pairs whose draft
+        # forward the drain hooks deferred, flushed by _flush_pairs in ONE lockstep
+        # sweep (per row-step a single batched forward_tokens_multi for the whole
+        # batch) instead of one eager per-request forward per verify step.
+        self._pairs_pending: List[Tuple[int, torch.Tensor, torch.Tensor]] = []
 
     def remove(self, uid: int) -> None:
+        self._pairs_pending = [p for p in self._pairs_pending if p[0] != uid]
         self.states.pop(uid, None)
         # Ineligibility is per-request, not per-uid: the offline LLM API renumbers
         # uids from 0 on every generate() call, so a stale entry here would poison
@@ -664,7 +763,7 @@ class MTPDraftManager:
         # candidates, so the substitution stays lossless.
         tokens = torch.tensor([token], dtype=torch.int32)
         self._ensure_cap(state, state.valid_len + 1 + self.num_draft - 1, req.max_device_len)
-        self._run_pairs(state, tokens, state.z)
+        self._defer_pairs(req.uid, tokens, state.z)
         if rechain:
             self._rechain(state, req.max_device_len)
         else:
@@ -727,7 +826,7 @@ class MTPDraftManager:
         self._ensure_cap(state, state.valid_len + tokens.shape[0] + self.num_draft - 1, req.max_device_len)
         if hidden_rows is not None:
             hiddens = hidden_rows[keep : accepted + 1]
-            self._run_pairs(state, tokens, hiddens)
+            self._defer_pairs(req.uid, tokens, hiddens)
         else:
             # Degraded drain (no target hiddens on the batch): roll the rejected
             # tail + bonus out with the draft's own z -- the same substitution the
@@ -739,12 +838,65 @@ class MTPDraftManager:
         else:
             self._rechain_pending.append((req.uid, req.max_device_len))
 
+    def _defer_pairs(self, uid: int, tokens: torch.Tensor, hiddens: torch.Tensor) -> None:
+        """Queue one request's (token, hidden) rows for the batched flush; the
+        caller has already _ensure_cap'd. valid_len/z advance at flush time."""
+        self._pairs_pending.append(
+            (uid, tokens.to(self.device, dtype=torch.int32), hiddens)
+        )
+
+    def _flush_pairs(self) -> None:
+        """Run every deferred (token, hidden) pair batch in one lockstep sweep:
+        per row-step j ONE forward_tokens_multi over the requests that still have
+        a row j (their rows are independent across requests; within a request row
+        j+1 legitimately attends row j, already written by step j -- identical to
+        the causal L-row forward _run_pairs used to run). C eager 1-2-row draft
+        forwards per verify step become <= max-rows batched forwards."""
+        if not self._pairs_pending:
+            return
+        entries, self._pairs_pending = self._pairs_pending, []
+        live: List[Tuple[_MTPReqState, torch.Tensor, torch.Tensor]] = []
+        for uid, tokens, hiddens in entries:
+            state = self.states.get(uid)
+            if state is None:  # finished/removed between defer and flush
+                continue
+            live.append((state, tokens, hiddens))
+        if not live:
+            return
+        max_rows = max(tokens.shape[0] for _, tokens, _ in live)
+        z_last: Dict[int, torch.Tensor] = {}
+        for j in range(max_rows):
+            idx = [i for i, (_, tokens, _) in enumerate(live) if tokens.shape[0] > j]
+            toks = torch.cat([live[i][1][j : j + 1] for i in idx])
+            hiddens = torch.cat([live[i][2][j : j + 1] for i in idx])
+            positions = torch.tensor(
+                [live[i][0].valid_len + j + 1 for i in idx],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_list = [
+                (live[i][0].k_cache, live[i][0].v_cache, live[i][0].valid_len + j)
+                for i in idx
+            ]
+            z_new = self.draft.forward_tokens_multi(toks, hiddens, positions, kv_list)
+            for r, i in enumerate(idx):
+                z_last[i] = z_new[r : r + 1]
+        for i, (state, tokens, hiddens) in enumerate(live):
+            if hiddens.is_cuda:
+                # Same record_stream discipline as _run_pairs: the target hiddens
+                # were allocated on the engine stream; keep the block alive until
+                # this stream's enqueued reads complete.
+                hiddens.record_stream(torch.cuda.current_stream())
+            state.valid_len += tokens.shape[0]
+            state.z = z_last[i]
+
     def flush_rechain(self) -> None:
         """Rechained every state deferred by the drain hooks in one lockstep sweep:
         per chain step ONE batched draft forward + ONE batched lm_head argmax for all
         requests, instead of a full weight sweep per request per step (the dominant
         draft cost at C>=2: B x (K-1) single-token sweeps -> K-1 B-token sweeps).
         Must run before the next seat_drafts (a pending state has no fresh chain)."""
+        self._flush_pairs()
         if not self._rechain_pending:
             return
         entries, self._rechain_pending = self._rechain_pending, []

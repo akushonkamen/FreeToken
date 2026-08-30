@@ -201,6 +201,10 @@ class OffloadMoeCache:
         self.lru_stats = torch.zeros(
             (self.num_layers, N_STATS), dtype=torch.int64, device=self.device
         )
+        # Verify-step counterpart of lru_stats: ensure_experts(verify=True) routes
+        # spec-verify layer calls here so the decode/verify miss split is readable
+        # without syncing per step. Same graph-capture discipline as lru_stats.
+        self.lru_stats_verify = torch.zeros_like(self.lru_stats)
         self.stat_missing = torch.zeros((), dtype=torch.int64, device=self.device)
         self.stat_active = torch.zeros((), dtype=torch.int64, device=self.device)
         self.stat_calls = torch.zeros((), dtype=torch.int64, device=self.device)
@@ -775,7 +779,9 @@ class OffloadMoeCache:
             self.src_indices = torch.empty((need,), dtype=torch.int32, device=self.device)
             self.evict_slots = torch.empty((need,), dtype=torch.int32, device=self.device)
 
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def ensure_experts(
+        self, layer_id: int, expert_ids: torch.Tensor, verify: bool = False
+    ) -> None:
         from prometheus.moe.offload_kernels import ensure_experts
 
         self._ensure_plan_scratch(expert_ids.numel())
@@ -786,7 +792,7 @@ class OffloadMoeCache:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
-        ensure_experts(self, layer_id, expert_ids)
+        ensure_experts(self, layer_id, expert_ids, verify=verify)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -827,6 +833,7 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self.lru_stats.zero_()
+        self.lru_stats_verify.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -943,6 +950,37 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
+    def expert_row_bytes(self) -> int:
+        """Host bytes moved per (layer, expert) miss: sum of every bank's row."""
+        if not self.bank_sources:
+            return 0
+        total = 0
+        for per_layer in self.bank_sources.values():
+            head = per_layer[0]
+            total += math.prod(head.shape[1:]) * head.element_size()
+        return int(total)
+
+    def moe_stats_dump(self) -> dict:
+        """Decode/verify split of the lru_stats accumulators (one host sync)."""
+        def agg(stats):
+            cols = stats.t().tolist()
+            active, missing, calls = sum(cols[Stat.ACTIVE]), sum(cols[Stat.MISS]), sum(cols[Stat.CALLS])
+            per_call = lambda n: (n / calls) if calls else 0.0
+            return {
+                "layer_calls": calls,
+                "steps": (calls / self.num_layers) if self.num_layers else 0,
+                "active_unique_per_call": per_call(active),
+                "missing_unique_per_call": per_call(missing),
+                "miss_rate": (missing / active) if active else 0.0,
+            }
+        eb = self.expert_row_bytes()
+        out = {"expert_row_bytes": eb}
+        for name, stats in (("decode", self.lru_stats), ("verify", self.lru_stats_verify)):
+            a = agg(stats)
+            a["miss_MB_per_call"] = a["missing_unique_per_call"] * eb / 1e6
+            out[name] = a
+        return out
+
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
@@ -1001,8 +1039,37 @@ def iter_offload_moe_layers(model) -> Iterator:
                 yield from iter_offload_moe_layers(item)
 
 
+def _start_moe_stats_dumper(cache: OffloadMoeCache) -> None:
+    """Periodically log the decode/verify miss split as one JSON line.
+
+    Opt-in measurement only: PROM_MOE_STATS_INTERVAL>0 with collect_stats on.
+    Daemon thread; each tick is one device sync + one log line.
+    """
+    import json
+    import threading
+    import time
+
+    try:
+        interval = float(os.getenv("PROM_MOE_STATS_INTERVAL", "0") or 0)
+    except ValueError:
+        interval = 0.0
+    if not (cache.collect_stats and interval > 0):
+        return
+
+    def _run():
+        while True:
+            time.sleep(interval)
+            try:
+                logger.info("MOE_STATS " + json.dumps(cache.moe_stats_dump()))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"MOE_STATS dump failed: {exc}")
+
+    threading.Thread(target=_run, daemon=True, name="moe-stats-dumper").start()
+
+
 def attach_offload_moe_cache(model, cache: OffloadMoeCache) -> list:
     layers = list(iter_offload_moe_layers(model))
     for layer in layers:
         layer.offload_cache = cache
+    _start_moe_stats_dumper(cache)
     return layers
