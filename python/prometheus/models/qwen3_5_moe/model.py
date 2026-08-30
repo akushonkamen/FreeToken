@@ -158,16 +158,31 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
 
         from .mtp import MTPDraft, load_mtp_state_dict
 
-        assert isinstance(self.lm_head, ParallelLMHead), (
-            "--spec-mtp requires the plain bf16 lm_head (untied, unquantized)"
+        from prometheus.kernel.triton.nvfp4_linear import Nvfp4LMHead
+
+        assert isinstance(self.lm_head, (ParallelLMHead, Nvfp4LMHead)), (
+            "--spec-mtp requires the plain bf16 or NVFP4 lm_head (untied)"
         )
         state = load_mtp_state_dict(model_path, device)
         if state is None:
             raise ValueError(f"--spec-mtp: no MTP draft head (mtp.*) in {model_path}")
         from prometheus.utils import torch_dtype
 
+        import json
+        import os
+
+        moe = False
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                # .get: an index without a weight_map key (other index schemas)
+                # simply has no MTP experts -> moe=False, not a boot-time KeyError.
+                moe = any(
+                    k.startswith("mtp.layers.0.mlp.experts.")
+                    for k in json.load(f).get("weight_map", {})
+                )
         with torch.device(device), torch_dtype(torch.bfloat16):
-            draft = MTPDraft(self._config, self.model.embed_tokens, self.lm_head)
+            draft = MTPDraft(self._config, self.model.embed_tokens, self.lm_head, moe=moe)
         draft.load_state_dict(state)
         draft.quantize_linears_nvfp4()
         return draft
