@@ -1,21 +1,71 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from prometheus.core import get_global_ctx
 from prometheus.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
+from prometheus.kernel.triton.causal_conv1d_small import causal_conv1d_varlen_small
 from prometheus.layers import BaseOP, LinearColParallelMerged
 
 from prometheus.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 from prometheus.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
 from prometheus.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged
 
-from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
+from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla, gdn_verify_fused
 from .quant_linear import make_replicated_quant
 
 # Device-side const tensors for GDN spec readvance (see Qwen3_5GatedDeltaNet.
 # spec_readvance): (rows, slot, device_index) -> (cu, idx, has_init).
 _SPEC_READVANCE_CONSTS: dict = {}
+
+# Devices whose tiny-conv Triton kernel has been JIT-warmed (MED-1): the first
+# spec-verify forward can run inside CUDA-graph capture, and a first-call compile
+# there is avoidable latency/capture risk. Dummy tensors only -- never touches
+# the state pool.
+_TINY_CONV_WARMED: set = set()
+
+
+def _prewarm_tiny_conv(module) -> None:
+    dev = module.conv1d.weight.device
+    if dev.index in _TINY_CONV_WARMED:
+        return
+    _TINY_CONV_WARMED.add(dev.index)
+    w = module._conv_weight()
+    dim, kw = w.shape
+    x = torch.zeros(1, dim, dtype=w.dtype, device=dev)
+    st = torch.zeros(1, dim, kw - 1, dtype=w.dtype, device=dev)
+    cu = torch.tensor([0, 1], dtype=torch.int64, device=dev)
+    idx = torch.zeros(1, dtype=torch.int32, device=dev)
+    for mt in (1, 2, 3, 4):
+        causal_conv1d_varlen_small(x, w, st, cu, idx, mt)
+
+
+# Env knobs are read ONCE at import (per-process launch config, same lifetime as
+# the process itself); the gates below run every forward and os.getenv each call
+# showed up as hot-path churn in the review.
+_ENV_FUSED_VERIFY = os.getenv("PROM_GDN_FUSED_VERIFY", "1") == "1"
+_ENV_FUSED_RECHAIN = os.getenv("PROM_GDN_FUSED_RECHAIN", "1") == "1"
+_ENV_FUSED_MAX_EXT = int(os.getenv("PROM_GDN_FUSED_MAX_EXT", "16"))
+_ENV_TINY_CONV = os.getenv("PROM_GDN_TINY_CONV", "1") == "1"
+
+
+def _fused_spec_verify(batch) -> bool:
+    """Route a spec-verify batch's GDN through the single fused verify kernel
+    (gdn_verify_fused) instead of the chunk pipeline. Opt out with
+    PROM_GDN_FUSED_VERIFY=0. Only short windows: the fused kernel walks t
+    sequentially inside the program, so real prefill keeps the chunk pipeline
+    (threshold PROM_GDN_FUSED_MAX_EXT, default 16 rows/request)."""
+    if not _ENV_FUSED_VERIFY or not batch.spec_verify:
+        return False
+    return all(r.extend_len <= _ENV_FUSED_MAX_EXT for r in batch.padded_reqs)
+
+
+def _fused_rechain(rows: int) -> bool:
+    """Same gate for the partial-accept re-advance (spec_readvance); separately
+    disableable with PROM_GDN_FUSED_RECHAIN=0 for isolating forward vs rechain."""
+    return _ENV_FUSED_VERIFY and _ENV_FUSED_RECHAIN and rows <= _ENV_FUSED_MAX_EXT
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -141,12 +191,27 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     def _conv_weight(self) -> torch.Tensor:
         return self.conv1d.weight.squeeze(1)  # [conv_dim, kernel] for the fused kernel
 
-    def _conv_prefill(self, conv_in, pool, cu_seqlens, cache_indices, has_initial_state) -> torch.Tensor:
+    def _conv_prefill(self, conv_in, pool, cu_seqlens, cache_indices, has_initial_state,
+                      max_t: int | None = None) -> torch.Tensor:
         """Varlen causal conv (fused sgl_kernel) with silu; reads/updates each request's
         conv state in place by ``cache_indices`` slot. ``conv_in`` [total, conv_dim].
-        ``cu_seqlens`` / ``cache_indices`` / ``has_initial_state`` come from FLAMetadata."""
+        ``cu_seqlens`` / ``cache_indices`` / ``has_initial_state`` come from FLAMetadata.
+        With a host ``max_t`` (short uniform windows: spec-verify / rechain) and
+        PROM_GDN_TINY_CONV != 0, use the one-launch tiny-window Triton kernel instead:
+        no transpose/contiguous, stride-general input, fresh contiguous output
+        (bit-exact vs the sgl op incl. the conv-state refresh)."""
         li = pool.local_index(self.layer_id)
+        if max_t is not None and max_t <= 32 and _ENV_TINY_CONV:
+            return causal_conv1d_varlen_small(
+                conv_in, self._conv_weight(), pool.conv_states[li],
+                cu_seqlens, cache_indices, max_t)
         x = conv_in.transpose(0, 1).contiguous()  # [conv_dim, total]
+        if x.data_ptr() == conv_in.data_ptr():
+            # total==1: the transposed view counts as contiguous, so the call above
+            # returned an ALIAS of conv_in -- and the sgl op writes silu(conv) into
+            # its input in place, clobbering conv_in (which spec_readvance stashed
+            # by reference). Force a real copy. (The tiny path is unaffected.)
+            x = x.clone()
         out = causal_conv1d_varlen(x, self._conv_weight(), pool.conv_states[li],
                                    cu_seqlens, cache_indices, has_initial_state)
         return out.transpose(0, 1)  # [total, conv_dim]
@@ -207,12 +272,22 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 )
                 _SPEC_READVANCE_CONSTS[key] = consts
             cu, idx, has_init = consts
-        mixed = self._conv_prefill(conv_in, pool, cu, idx, has_init)
+        mixed = self._conv_prefill(conv_in, pool, cu, idx, has_init, max_t=rows)
         dtype = conv_in.dtype
         qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         q = qf.reshape(1, rows, self.num_k_heads, self.head_k_dim).to(dtype)
         k = kf.reshape(1, rows, self.num_k_heads, self.head_k_dim).to(dtype)
         v = vf.reshape(1, rows, self.num_v_heads, self.head_v_dim).to(dtype)
+        if _fused_rechain(rows):
+            # One fused launch per layer instead of the 17-launch chunk pipeline;
+            # the captured RechainGraph records whichever branch runs at capture.
+            gdn_verify_fused(
+                q, k, v, a, b,
+                A_log=self.A_log, dt_bias=self.dt_bias,
+                state_source=pool.recurrent_states[li], indices=idx,
+                cu_seqlens=cu, scale=self.head_k_dim ** -0.5,
+            )
+            return
         g, beta = self._gate_params(a, b)
         g = g.reshape(1, rows, self.num_v_heads)
         beta = beta.float().reshape(1, rows, self.num_v_heads)
@@ -274,32 +349,60 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
             )
         else:
+            # max_t must bound the LONGEST per-req window, never the mean: mixed-ext
+            # batches run eager verify (no graph uniformity guard), and ext=[2,2,2,1]
+            # -> 7//4=1 would truncate the ext=2 rows, leaving uninitialized out rows
+            # silently fed to GDN (the kernel's `t < T` guard only prevents
+            # over-computing). extend_len is a host property: no device sync, and
+            # MAX_T only sizes the compile-time unroll.
+            _prewarm_tiny_conv(self)
             mixed = self._conv_prefill(
-                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state,
+                max_t=max(r.extend_len for r in batch.padded_reqs) if batch.spec_verify else None)
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
-            g, beta = self._gate_params(a, b)
-            g = g.reshape(1, total, self.num_v_heads)
-            beta = beta.float().reshape(1, total, self.num_v_heads)
-            # The chunk kernel reads + writes back initial_state[cache_indices] in place;
-            # fresh sequences (cached_len==0) must start from a zeroed slot.
-            if fla.fresh_state_indices is not None:
-                pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
-            track = fla.track_dst is not None
-            result = gdn_prefill_chunk_fla(
-                q, k, v, g, beta,
-                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
-                return_h=track,
-            )
-            if track:
-                core_out, h = result
-                self._write_track_snapshot(pool, li, conv_in, h, fla)
+            if _fused_spec_verify(batch):
+                # Spec-verify short window: ONE fused kernel advances the recurrent
+                # state over each request's (1+k) rows in-kernel (sequential per-t
+                # loop inside each program) instead of the 17-launch chunk pipeline
+                # (~41us -> ~10us GPU per GDN layer at bs=4/ext=2; eager wall per
+                # layer ~0.5ms -> ~60us). Same recurrence as chunk (the wrapper
+                # normalizes the transposed conv-output views to contiguous first --
+                # the fused kernel is not stride-general), so greedy longest-prefix
+                # verify semantics are unchanged (in-engine shadow A/B: o max-diff
+                # 3.9e-3 vs chunk, accept 1.94 vs 1.93, agg +3.4%).
+                # (Track snapshots are skipped here safely: build_fla_metadata
+                # unconditionally disables tracking for spec_verify batches, so
+                # fla.track_* is empty and no boundary state is missed.)
+                core_out = gdn_verify_fused(
+                    q, k, v, a, b,
+                    A_log=self.A_log, dt_bias=self.dt_bias,
+                    state_source=pool.recurrent_states[li], indices=fla.cache_indices,
+                    cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                )
             else:
-                core_out = result
+                g, beta = self._gate_params(a, b)
+                g = g.reshape(1, total, self.num_v_heads)
+                beta = beta.float().reshape(1, total, self.num_v_heads)
+                # The chunk kernel reads + writes back initial_state[cache_indices] in place;
+                # fresh sequences (cached_len==0) must start from a zeroed slot.
+                if fla.fresh_state_indices is not None:
+                    pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
+                track = fla.track_dst is not None
+                result = gdn_prefill_chunk_fla(
+                    q, k, v, g, beta,
+                    state_source=pool.recurrent_states[li], indices=fla.cache_indices,
+                    cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                    return_h=track,
+                )
+                if track:
+                    core_out, h = result
+                    self._write_track_snapshot(pool, li, conv_in, h, fla)
+                else:
+                    core_out = result
 
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
