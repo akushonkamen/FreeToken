@@ -111,6 +111,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         conv_kernel_size, rms_norm_eps, layer_id, expert_quant: str = "none",
         attn_quant: str = "none", in_proj_split: bool = False,
         in_proj_nvfp4: bool = False, gate_activation: str = "silu",
+        out_proj_nvfp4: bool = True,
     ):
         self.layer_id = layer_id
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
@@ -179,8 +180,11 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # NVFP4 (W4A16) / bf16. in_proj_ba stays bf16 in every mode (above); a compressed-
         # tensors NVFP4 checkpoint with packed in_proj parts (_nvfp4_qkvz) also makes qkvz
         # and out_proj native FP4.
+        # Hybrid ct exports (REAP Ornith) keep out_proj bf16 while attn_quant=="nvfp4"
+        # still serves the packed self_attn projections: only demote out_proj then.
+        out_proj_quant = attn_quant if out_proj_nvfp4 or attn_quant != "nvfp4" else "none"
         self.out_proj = make_replicated_quant(
-            expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
+            expert_quant, out_proj_quant, self.value_dim, hidden_size, has_bias=False
         )
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):

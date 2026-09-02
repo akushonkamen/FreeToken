@@ -72,6 +72,25 @@ def _gdn_in_proj_packed(model_path: str | None) -> bool:
     return False
 
 
+def _gdn_out_proj_packed(model_path: str | None) -> bool:
+    """Whether the checkpoint stores the GDN ``out_proj`` as ct-packed NVFP4
+    (``weight_packed``) rather than bf16. Hybrid exports (Ttimms REAP-pruned Ornith)
+    pack self_attn q/k/v/o + experts but keep all GDN projections bf16; the model
+    then builds out_proj as the plain bf16 replicated linear. Defaults to True
+    (legacy ct path) when undeterminable."""
+    if model_path is None:
+        return True
+    import safetensors
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+            keys = list(f.keys())
+            if any(k.endswith(".linear_attn.out_proj.weight_packed") for k in keys):
+                return True
+            if any(k.endswith(".linear_attn.out_proj.weight") for k in keys):
+                return False
+    return True
+
+
 def _fp8_block_quant(hf_config: Any) -> tuple[str, tuple[int, int] | None]:
     """Detect DeepSeek-V3-style 128x128 block-fp8 from HF ``quantization_config``.
 
@@ -315,6 +334,7 @@ def parse_config(hf_config: Any, model_path: str | None = None) -> ModelConfig:
         output_gate=True,
         in_proj_split=_gdn_split_layout(model_path),
         in_proj_nvfp4=_gdn_in_proj_packed(model_path),
+        out_proj_nvfp4=_gdn_out_proj_packed(model_path),
     )
     # Order groups by their first layer id for deterministic iteration.
     groups = tuple(

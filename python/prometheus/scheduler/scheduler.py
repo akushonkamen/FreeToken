@@ -114,6 +114,10 @@ class Scheduler(SchedulerIOMixin):
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
+        # Single-token id of </think>, consumed by Engine._force_think_end for
+        # reasoning_budget forcing. None (multi-token spelling) disables it.
+        self.think_end_token_id = load_toolcall_anchor_id(self.tokenizer, "</think>")
+        self.engine.think_end_token_id = self.think_end_token_id
         self.toolcall_anchor_id = None
         if config.special_token_ckpt and (
             self.cache_manager.is_hybrid or self.cache_manager.is_swa
@@ -460,6 +464,13 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+                if (
+                    self.think_end_token_id is not None
+                    and next_token == self.think_end_token_id
+                ):
+                    # Natural reasoning exit: stop the reasoning_budget forcing
+                    # (Engine._force_think_end) from firing post-answer.
+                    req.think_closed = True
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
                 hit_length = not req.can_decode

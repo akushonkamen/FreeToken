@@ -46,6 +46,7 @@ class Qwen3_5DecoderLayer(BaseOP):
                 attn_quant=config.attn_quant,
                 in_proj_split=g.in_proj_split,
                 in_proj_nvfp4=g.in_proj_nvfp4,
+                out_proj_nvfp4=g.out_proj_nvfp4,
             )
         else:
             self.self_attn = Qwen3_5Attention(config, layer_id)

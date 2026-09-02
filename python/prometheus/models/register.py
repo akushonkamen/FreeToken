@@ -72,6 +72,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "prometheus.models.qwen3_5_moe",
         "Qwen3_5MoEForCausalLM",
     ),
+    # Text-only MoE sibling (model_type qwen3_5_moe_text, e.g. Ttimms REAP-pruned
+    # Ornith NVFP4A16 exports): flat weights (model.layers.*, no language_model
+    # wrapper), compressed-tensors packed NVFP4 experts. Same decoder/loader package.
+    "Qwen3_5MoeForCausalLM": ModelSpec(
+        "prometheus.models.qwen3_5_moe",
+        "Qwen3_5MoEForCausalLM",
+    ),
     # Qwen3-Next (model_type qwen3_next): Gated DeltaNet + MoE with FP8 block quantization.
     # Same architecture family as Qwen3.5 MoE (linear_attn + full_attn interleaving, MoE
     # experts) -- reuses the qwen3_5_moe package. Weights are flat (model.layers.*, no

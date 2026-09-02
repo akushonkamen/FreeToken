@@ -165,6 +165,10 @@ class LinearGatedDeltaGroupConfig(BaseAttentionGroupConfig):
     # packed NVFP4 (``in_proj_qkv.weight_packed``) instead of bf16: qkv|z are then served by
     # the native W4A16 kernel rather than dequantized to bf16 at load.
     in_proj_nvfp4: bool = False
+    # Checkpoint stores the GDN ``out_proj`` as ct-packed NVFP4. Hybrid exports
+    # (Ttimms REAP-pruned Ornith) quantize self_attn q/k/v/o but keep every GDN
+    # projection bf16; out_proj then falls back to the bf16 replicated linear.
+    out_proj_nvfp4: bool = True
 
 
 @dataclass(frozen=True)

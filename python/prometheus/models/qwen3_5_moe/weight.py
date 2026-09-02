@@ -89,7 +89,8 @@ class _Bf16ExpertPacker:
         return sorted(self._parts), sorted(self._layers)
 _NVFP4_EXPERT_KEY_RE = re.compile(
     r"^model\.(?:language_model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
+    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<kind>weight|weight_scale|weight_scale_2|weight_packed|weight_global_scale)$"
 )
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_NVFP4_EXPERT_KEY_RE,
@@ -691,6 +692,11 @@ def _iter_weights_attn_fp8(
 _CT_NVFP4_FUSE: dict[str, tuple[str, ...]] = {
     ".self_attn.qkv_proj": (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"),
     ".mlp.gate_up_proj": (".mlp.gate_proj", ".mlp.up_proj"),
+    # MoE shared expert (ct exports quantize it, unlike modelopt which leaves it bf16):
+    # fuse gate|up into the native-FP4 gate_up_proj the model expects.
+    ".mlp.shared_expert.gate_up_proj": (
+        ".mlp.shared_expert.gate_proj", ".mlp.shared_expert.up_proj",
+    ),
 }
 _CT_BF16_FUSE: dict[str, tuple[str, ...]] = {
     ".linear_attn.in_proj": (
@@ -779,6 +785,15 @@ def _iter_weights_compressed_tensors(
 
                 name = _rename(raw_name)
                 if name is None:
+                    continue
+                if ".mlp.experts." in name:
+                    # Routed experts (ct-packed MoE checkpoints, e.g. REAP-pruned Ornith)
+                    # load through the offload banks, never the dense state dict.
+                    if include_moe_experts:
+                        raise NotImplementedError(
+                            "resident (non-offload) loading of compressed-tensors NVFP4 "
+                            "routed experts is not supported; use --moe-backend offload"
+                        )
                     continue
 
                 if raw_name.endswith(".weight_packed"):  # NVFP4 projection

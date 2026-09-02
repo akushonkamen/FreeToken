@@ -953,10 +953,45 @@ class Engine:
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        self._force_think_end(batch, next_tokens_gpu)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _force_think_end(self, batch: "Batch", next_tokens_gpu: torch.Tensor) -> None:
+        """reasoning_budget forcing (vLLM-style): substitute the think-end token
+        once a request's generated-token count reaches its budget while still
+        inside the <think> block, so quantization-damaged models that cannot
+        terminate their reasoning on their own still transition to the answer.
+
+        Runs on the engine stream right after sampling and BEFORE the token is
+        copied to host or committed to the token pool, so the forced id is what
+        the next forward consumes -- overriding on the scheduler side instead
+        would desynchronize the GPU-side next-step input from the drained reply.
+
+        think_closed is set by the scheduler's drain when the think-end token
+        actually lands; overlap scheduling launches this step before that drain,
+        so a natural </think> emitted at/after the budget can be followed by one
+        forced emit a step later. The stray extra tag is harmless -- the server's
+        reasoning parser strips it. Spec-verify batches never take this path
+        (they return before the sampler); wiring the budget into spec decode
+        would belong in Scheduler._verify_spec_draft.
+        """
+        tid = getattr(self, "think_end_token_id", None)
+        if tid is None or batch.spec_verify:
+            return
+        for i, req in enumerate(batch.reqs):
+            sp = req.sampling_params  # None on warmup/dummy reqs
+            if sp is None or sp.reasoning_budget is None or req.think_closed:
+                continue
+            budget = sp.reasoning_budget
+            # Generated so far: device_len counts the token being sampled
+            # (complete_one advanced it), prompt_len = max_device_len - output_len.
+            gen = req.device_len - (req.max_device_len - req.output_len)
+            if gen >= budget:
+                next_tokens_gpu[i] = tid
+                req.think_closed = True
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

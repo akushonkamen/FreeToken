@@ -163,6 +163,7 @@ def resolve_sampling(
     ignore_eos: bool,
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
+    reasoning_budget: int | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -177,6 +178,8 @@ def resolve_sampling(
     # non-positive value is a client error.
     if max_tokens is not None and max_tokens < 1:
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
+    if reasoning_budget is not None and reasoning_budget < 1:
+        raise ValueError(f"reasoning_budget must be at least 1, got {reasoning_budget}")
     return SamplingParams(
         ignore_eos=ignore_eos,
         max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
@@ -184,6 +187,7 @@ def resolve_sampling(
         top_k=pick(top_k, "top_k", -1),
         top_p=pick(top_p, "top_p", 1.0),
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
+        reasoning_budget=reasoning_budget,
     )
 
 

@@ -62,6 +62,27 @@ def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
     }, num_layers)
 
 
+def _weight_map(folder: str) -> dict[str, str]:
+    """The index.json weight_map, or a synthesized one for index-less checkpoints
+    (single-file ct exports, e.g. Ttimms REAP NVFP4A16: one model.safetensors)."""
+    index_path = os.path.join(folder, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            return json.load(f)["weight_map"]
+    import glob as _glob
+
+    weight_map: dict[str, str] = {}
+    for shard in sorted(
+        os.path.basename(p) for p in _glob.glob(os.path.join(folder, "*.safetensors"))
+    ):
+        with safetensors.safe_open(os.path.join(folder, shard), framework="pt", device="cpu") as f:
+            for name in f.keys():
+                weight_map[name] = shard
+    if not weight_map:
+        raise FileNotFoundError(f"no safetensors shards found in {folder}")
+    return weight_map
+
+
 def load_nvfp4_expert_source_banks(
     model_path: str,
     config,
@@ -87,9 +108,7 @@ def load_nvfp4_expert_source_banks(
     until then (the caller owns that tradeoff).
     """
     folder = download_hf_weight(model_path)
-    index_path = os.path.join(folder, "model.safetensors.index.json")
-    with open(index_path, encoding="utf-8") as f:
-        weight_map = json.load(f)["weight_map"]
+    weight_map = _weight_map(folder)
 
     E = config.num_experts
     H = config.hidden_size
@@ -113,9 +132,9 @@ def load_nvfp4_expert_source_banks(
         if proj not in spec.proj_to_role:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert projection {proj!r}")
         kind = match.group("kind")
-        if kind == "weight_scale_2":
+        if kind in ("weight_scale_2", "weight_global_scale"):
             global_shards[shard].append((name, match, bank_layer))
-        elif kind in {"weight", "weight_scale"}:
+        elif kind in {"weight", "weight_scale", "weight_packed"}:
             weight_shards[shard].append((name, match, bank_layer))
         else:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
@@ -130,7 +149,11 @@ def load_nvfp4_expert_source_banks(
                     int(match.group("expert")),
                     match.group("proj"),
                 )
-                globals_map[key] = f.get_tensor(name).to(torch.float16)
+                t = f.get_tensor(name)
+                if match.group("kind") == "weight_global_scale":
+                    # ct global is the quant-side scalar; native per-row global = 1/g
+                    t = (1.0 / t.reshape(1).to(torch.float32)).to(torch.float16)
+                globals_map[key] = t
         drop_page_cache(path)
 
     _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
@@ -156,7 +179,7 @@ def load_nvfp4_expert_source_banks(
                     role = spec.proj_to_role[proj]
                     kind = match.group("kind")
                     tensor = f.get_tensor(name)
-                    if kind == "weight":
+                    if kind in ("weight", "weight_packed"):
                         if role == "gate":
                             gate_up_packed[bank_layer_id][expert, :I] = tensor
                         elif role == "up":
@@ -219,8 +242,7 @@ def load_nvfp4_expert_source_banks_parallel(
     from prometheus.models.weight import iter_expert_tensors_parallel
 
     folder = download_hf_weight(model_path)
-    with open(os.path.join(folder, "model.safetensors.index.json"), encoding="utf-8") as f:
-        weight_map = json.load(f)["weight_map"]
+    weight_map = _weight_map(folder)
 
     E = config.num_experts
     H = config.hidden_size
@@ -237,9 +259,9 @@ def load_nvfp4_expert_source_banks_parallel(
         if bank_layer is None:
             continue
         kind = match.group("kind")
-        if kind == "weight_scale_2":
+        if kind in ("weight_scale_2", "weight_global_scale"):
             global_names_by_shard[shard].append(name)
-        elif kind in {"weight", "weight_scale"}:
+        elif kind in {"weight", "weight_scale", "weight_packed"}:
             weight_info[name] = (match, bank_layer)
         else:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
@@ -252,9 +274,11 @@ def load_nvfp4_expert_source_banks_parallel(
         with safetensors.safe_open(path, framework="pt", device="cpu") as f:
             for name in global_names_by_shard[shard]:
                 m = spec.key_pattern.match(name)
-                globals_map[(int(m.group("layer")), int(m.group("expert")), m.group("proj"))] = (
-                    f.get_tensor(name).to(torch.float16)
-                )
+                t = f.get_tensor(name)
+                if m.group("kind") == "weight_global_scale":
+                    # ct quant-side scalar -> native per-row reciprocal global
+                    t = (1.0 / t.reshape(1).to(torch.float32)).to(torch.float16)
+                globals_map[(int(m.group("layer")), int(m.group("expert")), m.group("proj"))] = t
         drop_page_cache(path)
 
     _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
@@ -280,7 +304,7 @@ def load_nvfp4_expert_source_banks_parallel(
             proj = match.group("proj")
             role = spec.proj_to_role[proj]
             kind = match.group("kind")
-            if kind == "weight":
+            if kind in ("weight", "weight_packed"):
                 if role == "gate":
                     gate_up_packed[bank_layer_id][expert, :I] = tensor
                 elif role == "up":

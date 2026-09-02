@@ -25,6 +25,13 @@ class SamplingParams:
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)
+    # Soft cap on reasoning tokens (vLLM `reasoning_budget`). Once the request has
+    # generated this many tokens without emitting the closing </think>, the engine
+    # forces the think-end token so the model transitions to its final answer
+    # instead of running to max_tokens. None (default) disables the forcing.
+    # Meaningful only with thinking on: a no-think request would get a stray
+    # </think> at budget (the reasoning parser strips it).
+    reasoning_budget: int | None = None
 
     @property
     def is_greedy(self) -> bool:
@@ -68,6 +75,11 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # reasoning_budget bookkeeping: True once the think-end token has been emitted
+    # (naturally or forced), so the budget forcing fires at most once per request.
+    # Set by the scheduler's drain one step after the token itself (overlap) --
+    # see Engine._force_think_end for the harmless double-emit corner.
+    think_closed: bool = False
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

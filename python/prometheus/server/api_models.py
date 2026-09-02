@@ -78,6 +78,11 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: float = 0.0
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     reasoning_effort: str | None = None
+    # vLLM-style soft cap on reasoning tokens: once the model has generated this
+    # many tokens without emitting </think>, the engine forces the think-end
+    # token so it transitions to its answer (quantized thinking models that
+    # cannot terminate their reasoning otherwise). No-op unless thinking is on.
+    reasoning_budget: int | None = None
     # DeepSeek-wire thinking toggle ({"type": "enabled"|"disabled"}). Any so a
     # foreign shape stays ignored (extra="allow" swallowed it before this field
     # existed) instead of becoming a bare 422 at the route boundary; the handler
@@ -115,6 +120,8 @@ class CompletionRequest(BaseModel):
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     ignore_eos: bool = False
+    # See ChatCompletionRequest.reasoning_budget (shared engine forcing).
+    reasoning_budget: int | None = None
     logprobs: int | None = None
     echo: bool = False
     suffix: str | None = None
