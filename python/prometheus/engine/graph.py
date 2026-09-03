@@ -228,13 +228,19 @@ def _determine_cuda_graph_bs(
 
 
 def get_free_memory(device: torch.device) -> int:
-    return torch.cuda.mem_get_info(device)[0]
+    if device.type == "cuda":
+        return torch.cuda.mem_get_info(device)[0]
+    # MPS / CPU: defer to the engine's device abstraction (avoids importing
+    # prometheus.device at module top to keep the CUDA import graph unchanged).
+    from prometheus.device import free_memory as _free_mem
+
+    return _free_mem(device)
 
 
 class GraphRunner:
     def __init__(
         self,
-        stream: torch.cuda.Stream,
+        stream: "torch.cuda.Stream",
         device: torch.device,
         model: BaseLLMModel,
         attn_backend: BaseAttnBackend,
@@ -248,11 +254,16 @@ class GraphRunner:
         spec_ext: int | None = None,
         spec_max_bs: int = 1,
     ) -> None:
-        cuda_graph_bs = _determine_cuda_graph_bs(
-            cuda_graph_bs=cuda_graph_bs,
-            cuda_graph_max_bs=cuda_graph_max_bs,
-            free_memory=free_memory,
-        )
+        # CUDA graph capture is CUDA-only; on MPS/CPU disable it entirely.
+        is_cuda = device.type == "cuda"
+        if is_cuda:
+            cuda_graph_bs = _determine_cuda_graph_bs(
+                cuda_graph_bs=cuda_graph_bs,
+                cuda_graph_max_bs=cuda_graph_max_bs,
+                free_memory=free_memory,
+            )
+        else:
+            cuda_graph_bs = []
         self.attn_backend = attn_backend
         self.model = model
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from typing import TYPE_CHECKING, Tuple
 
@@ -6,13 +8,15 @@ from prometheus.core import get_global_ctx
 from prometheus.distributed import DistributedCommunicator, get_tp_info
 from prometheus.moe import is_offload_moe_backend
 from prometheus.moe.fused import fused_experts_decode_impl, fused_experts_impl, fused_topk
-from prometheus.moe.offload_cache import OffloadMoeCache
 from prometheus.utils import div_even
 
 from .base import BaseOP
 
 if TYPE_CHECKING:
     from prometheus.models.config import ModelConfig
+    # CUDA offload-path import; flashlib.kernels pulls triton unconditionally
+    # (Linux-only), so keep it out of the module import graph on CPU-only hosts.
+    from prometheus.moe.offload_cache import OffloadMoeCache
 
 # Router decision (topk_weights[float32], topk_ids[int32]) for models whose router
 # is computed outside the MoE layer. Such models call ``routed_forward`` (offload) or

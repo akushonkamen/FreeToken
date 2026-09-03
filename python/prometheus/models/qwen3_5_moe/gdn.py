@@ -148,7 +148,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
         if self._split:
             if self._fp8:
-                ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
+                if self._block_fp8:
+                    from prometheus.kernel.triton.fp8_block_linear import Fp8BlockColMerged as ColMerged
+                else:
+                    from prometheus.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged as ColMerged
                 self.in_proj_qkvz = ColMerged(
                     hidden_size, [self.conv_dim, self.value_dim], has_bias=False
                 )

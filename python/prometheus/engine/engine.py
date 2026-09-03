@@ -9,13 +9,23 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 import torch
 from prometheus.attention import AttnType, attention_backend_info, create_attention_backend
 from prometheus.core import Batch, Context, Req, set_global_ctx
+from prometheus.device import (
+    _NullEvent,
+    _NullStream,
+    device_sync,
+    empty_cache as _device_empty_cache,
+    free_memory as _device_free_memory,
+    get_device_name,
+    make_stream,
+    resolve_device,
+    reset_peak_memory_stats,
+    set_stream,
+)
 from prometheus.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from prometheus.gpu_select import gpu_identity
 from prometheus.layers import set_rope_device
 from prometheus.models import create_model, load_weight
 from prometheus.moe import create_moe_backend, is_offload_moe_backend
-from prometheus.moe.expert_banks import load_expert_banks
-from prometheus.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from prometheus.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -122,21 +132,29 @@ def _resolve_auto_attention_backend(
     types. Reproduces the historical hardware tree for FULL-only models:
     sm_100 -> trtllm, sm_90+sgl_kernel -> "fa,fi", flashinfer -> fi, else triton."""
     candidates: list[tuple[str, bool]] = []
-    if AttnType.DSV4 in required:
+    # Non-CUDA host: the triton/flashinfer backends are CUDA-only; SDPA has an
+    # MPS-optimized path and serves FULL+SWA.
+    _is_cuda = torch.cuda.is_available()
+    if AttnType.DSV4 in required and _is_cuda:
         candidates.append(("dsv4_sparse", True))
-    if required & {AttnType.MLA, AttnType.DSA}:
+    if required & {AttnType.MLA, AttnType.DSA} and _is_cuda:
         candidates.append(("dsa", True))
-    if AttnType.BSA in required:
+    if AttnType.BSA in required and _is_cuda:
         candidates.append(("m3_sparse", True))
+    if not _is_cuda:
+        candidates.append(("sdpa", True))
     if AttnType.SWA in required:
-        candidates.append(("triton", True))
+        candidates.append(("triton", True) if _is_cuda else ("sdpa", True))
     if AttnType.FULL in required:
-        candidates += [
-            ("trtllm", is_sm100_family()),
-            ("fa,fi", is_sm90_family()),
-            ("fi", True),
-            ("triton", True),
-        ]
+        if _is_cuda:
+            candidates += [
+                ("trtllm", is_sm100_family()),
+                ("fa,fi", is_sm90_family()),
+                ("fi", True),
+                ("triton", True),
+            ]
+        else:
+            candidates.append(("sdpa", True))
     for name, arch_ok in candidates:
         if not arch_ok:
             continue
@@ -287,12 +305,11 @@ def _materialize_loaded_weight_state_dict(
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
-    copy_done_event: torch.cuda.Event
+    copy_done_event: "torch.cuda.Event | _NullEvent"
 
 
 class Engine:
     def __init__(self, config: EngineConfig):
-        assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         if os.getenv("PROM_PTRACER") == "1":
             import ctypes
@@ -306,8 +323,8 @@ class Engine:
         self.device = bind_assigned_gpu(config.tp_info.rank)
         _adjust_config(config)
         torch.manual_seed(42)
-        self.stream = torch.cuda.Stream()
-        torch.cuda.set_stream(self.stream)
+        self.stream = make_stream(self.device)
+        set_stream(self.stream)
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
         # KV pool family fixed at construction from the model config: its classmethods own the
@@ -532,6 +549,11 @@ class Engine:
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
+        # CUDA offload-path imports (flashlib.kernels pulls triton, Linux-only);
+        # deferred so CPU-only hosts can import the engine module graph.
+        from prometheus.moe.expert_banks import load_expert_banks
+        from prometheus.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
+
         # A model may fully own cache construction via make_offload_moe_cache.
         # Otherwise load_expert_banks gives the model module a setup hook first, then
         # falls back to per-quant providers, and the engine wires the banks into cache.
@@ -702,14 +724,15 @@ class Engine:
 
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
-        torch.cuda.synchronize(self.device)
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(self.device)
-        free_memory = get_free_memory(self.device)
-        free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
-        torch.distributed.all_reduce(
-            free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
-        )
+        device_sync(self.device)
+        _device_empty_cache(self.device)
+        reset_peak_memory_stats(self.device)
+        free_mem = _device_free_memory(self.device)
+        free_mem_tensor = torch.tensor([free_mem, -free_mem], device="cpu", dtype=torch.int64)
+        if self.device.type == "cuda":
+            torch.distributed.all_reduce(
+                free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+            )
         min_free_memory = int(free_mem_tensor[0].item())
         max_free_memory = -int(free_mem_tensor[1].item())
         if max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024:
@@ -850,7 +873,7 @@ class Engine:
             ),
         )
 
-        torch.cuda.synchronize(self.device)
+        device_sync(self.device)
         # Preserve the CUDA-graph batch-size set resolved at startup. The auto heuristic keys
         # off free memory, which is far smaller now that the caches are resident (post-cache
         # free << startup pre-load free), so re-deriving it here would silently drop large
@@ -955,7 +978,7 @@ class Engine:
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         self._force_think_end(batch, next_tokens_gpu)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
+        copy_done_event = _NullEvent() if self.device.type != "cuda" else torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
@@ -1014,8 +1037,8 @@ class Engine:
 
         dummy_row = self.page_table[self.dummy_req.table_idx]
         dummy_slot = int(dummy_row[0].item())
-        started = torch.cuda.Event(enable_timing=True)
-        ended = torch.cuda.Event(enable_timing=True)
+        started = _NullEvent(enable_timing=True) if self.device.type != "cuda" else torch.cuda.Event(enable_timing=True)
+        ended = _NullEvent(enable_timing=True) if self.device.type != "cuda" else torch.cuda.Event(enable_timing=True)
         started.record(self.stream)
         try:
             for length in warmup_lens:
@@ -1044,7 +1067,7 @@ class Engine:
             if self.moe_offload_cache is not None:
                 self.moe_offload_cache.reset()
         ended.record(self.stream)
-        torch.cuda.synchronize(self.device)
+        device_sync(self.device)
         logger.info_rank0(
             f"Prefill warmup complete for lengths {warmup_lens} "
             f"in {started.elapsed_time(ended) / 1000.0:.3f} s"
@@ -1529,3 +1552,19 @@ def _adjust_config(config: EngineConfig):
     if is_moe:
         resolved.insert(0, f"moe_backend={config.moe_backend!r}")
     logger.info_rank0(f"Resolved config: {', '.join(resolved)}")
+
+    # Non-CUDA host (Apple Silicon / MPS): the Triton NVFP4 W4A16 linear and
+    # FP8 block-linear kernels have no MPS build. Force every quant field to
+    # "none"/"bf16" so the weight loader dequantizes to bf16 at load time and
+    # the model uses plain bf16 Linear layers at runtime. Memory cost: a 27B
+    # NVFP4 checkpoint (~14GB packed) expands to ~54GB bf16, within 64GB unified.
+    _dev = resolve_device()
+    if _dev.type != "cuda":
+        for _attr in ("expert_quant", "dense_quant", "attn_quant", "lm_head_quant"):
+            _cur = getattr(model_config, _attr, "none")
+            if _cur != "none":
+                object.__setattr__(model_config, _attr, "none")
+                logger.info_rank0(
+                    f"Non-CUDA device ({_dev}): dequantizing {_attr} (was {_cur!r}) "
+                    "to bf16 at load time; Triton quant kernels are unavailable."
+                )

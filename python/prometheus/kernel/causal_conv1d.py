@@ -27,12 +27,21 @@ def causal_conv1d_varlen(
     in place and refreshes ``conv_states[cache_indices]`` with each request's tail."""
     from prometheus.kernel.backend import is_sgl_kernel_installed
 
-    if not is_sgl_kernel_installed():
-        from prometheus.kernel.triton.causal_conv1d_triton import (
-            causal_conv1d_varlen as triton_causal_conv1d_varlen,
-        )
+    try:
+        import triton  # noqa: F401
 
-        return triton_causal_conv1d_varlen(
+        if not is_sgl_kernel_installed():
+            from prometheus.kernel.triton.causal_conv1d_triton import (
+                causal_conv1d_varlen as triton_causal_conv1d_varlen,
+            )
+
+            return triton_causal_conv1d_varlen(
+                x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state
+            )
+    except ImportError:
+        from prometheus.kernel.torch_causal_conv1d import causal_conv1d_varlen as _torch_varlen
+
+        return _torch_varlen(
             x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state
         )
 
@@ -58,12 +67,19 @@ def causal_conv1d_decode(
     token into ``conv_state[conv_state_indices]`` in place and returns silu(conv)."""
     from prometheus.kernel.backend import is_sgl_kernel_installed
 
-    if not is_sgl_kernel_installed():
-        from prometheus.kernel.triton.causal_conv1d_triton import (
-            causal_conv1d_decode as triton_causal_conv1d_decode,
-        )
+    try:
+        import triton  # noqa: F401
 
-        return triton_causal_conv1d_decode(x, conv_state, weight, conv_state_indices)
+        if not is_sgl_kernel_installed():
+            from prometheus.kernel.triton.causal_conv1d_triton import (
+                causal_conv1d_decode as triton_causal_conv1d_decode,
+            )
+
+            return triton_causal_conv1d_decode(x, conv_state, weight, conv_state_indices)
+    except ImportError:
+        from prometheus.kernel.torch_causal_conv1d import causal_conv1d_decode as _torch_decode
+
+        return _torch_decode(x, conv_state, weight, conv_state_indices)
 
     from sgl_kernel import causal_conv1d_update
 

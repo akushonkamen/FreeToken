@@ -132,6 +132,21 @@ def create_m3_sparse_backend(config: ModelConfig):
     return M3SparseAttnBackend(config)
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register(
+    "sdpa",
+    BackendInfo(
+        supported_types=frozenset({AttnType.FULL, AttnType.SWA}),
+        consumes_attn_spec=False,
+        requires_flashinfer=False,
+        hybrid_linear_ok=True,
+    ),
+)
+def create_sdpa_backend(config: ModelConfig):
+    from .sdpa import SDPAAttentionBackend
+
+    return SDPAAttentionBackend(config)
+
+
 def attention_backend_info(name: str) -> BackendInfo:
     return SUPPORTED_ATTENTION_BACKENDS.info(name)
 

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, NoReturn, Set, Tuple, 
 import torch
 from prometheus.attention.linear import build_fla_metadata
 from prometheus.core import Batch, Req
+from prometheus.device import make_stream, set_stream, stream_context, device_sync
 from prometheus.env import ENV
 from prometheus.gpu_select import gpu_identity
 from prometheus.message import (
@@ -177,7 +178,7 @@ class Scheduler(SchedulerIOMixin):
         """
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
-        torch.cuda.synchronize(self.device)
+        device_sync(self.device)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
         self.engine.rebuild_runtime_cache(
@@ -316,13 +317,15 @@ class Scheduler(SchedulerIOMixin):
                 while True:
                     self.normal_loop()
         else:
-            assert torch.cuda.current_stream() == self.stream
+            # On MPS/CPU there is no current_stream(); the assert is CUDA-only.
+            if self.device.type == "cuda":
+                assert torch.cuda.current_stream() == self.stream
             data = None
             while True:
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
-        torch.cuda.synchronize(self.device)
+        device_sync(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
 

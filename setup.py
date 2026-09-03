@@ -31,12 +31,19 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
     return [str(cuda_home / "include")], library_dirs
 
 
-cuda_include_dirs, cuda_library_dirs = _cuda_runtime_paths()
-_check_toolchain()
+# CUDA-only build. Both extensions link cudart (pinned-memory host allocs for the
+# offload backend; cudaLaunchHostFunc graph nodes in the CPU MoE executor). On a
+# machine without a CUDA toolkit (e.g. macOS / CPU-only) skip them: the CUDA
+# offload paths raise at use time, and --moe-backend cpu on a dense model never
+# touches the MoE executor.
+if CUDA_HOME is None:
+    _cuda_ext_modules = []
+else:
+    cuda_include_dirs, cuda_library_dirs = _cuda_runtime_paths()
+    _check_toolchain()
+    _cuda_ext_modules = [
 
 
-setup(
-    ext_modules=[
         CppExtension(
             name="prometheus.kernel._pinned_tensor",
             sources=[
@@ -62,6 +69,9 @@ setup(
             libraries=["cudart"],
             extra_compile_args=["-O3", "-std=c++17", "-pthread"],
         ),
-    ],
+    ]
+
+setup(
+    ext_modules=_cuda_ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )

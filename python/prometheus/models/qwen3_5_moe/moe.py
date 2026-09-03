@@ -12,8 +12,6 @@ from prometheus.layers import (
     silu_and_mul,
 )
 
-from prometheus.kernel.triton.fp8_block_linear import Fp8BlockColMerged, Fp8BlockLinear
-
 if TYPE_CHECKING:
     from prometheus.models.config import ModelConfig
 
@@ -23,6 +21,8 @@ class _SharedExpert(BaseOP):
 
     def __init__(self, config: ModelConfig, hidden_size: int, intermediate_size: int):
         if getattr(config, "expert_quant", "none") == "fp8_block":
+            from prometheus.kernel.triton.fp8_block_linear import Fp8BlockColMerged, Fp8BlockLinear
+
             self.gate_up_proj = Fp8BlockColMerged(
                 hidden_size, [intermediate_size, intermediate_size], has_bias=False
             )

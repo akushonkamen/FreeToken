@@ -22,11 +22,30 @@ stripped/inlined on vendoring). Keep ``chunk_delta_h.py``'s single fixed ``trito
 upstream's multi-config autotune corrupts the in-place state pool. Tune via the env knobs
 ``SGLANG_GDN_CHUNK_H_BV`` / ``SGLANG_GDN_CHUNK_H_NUM_WARPS`` / ``SGLANG_GDN_CHUNK_H_NUM_STAGES``.
 """
-from prometheus.kernel.fla.chunk import chunk_gated_delta_rule
-from prometheus.kernel.fla.fused_sigmoid_gating_recurrent import (
-    fused_sigmoid_gating_delta_rule_update,
-)
-from prometheus.kernel.fla.layernorm_gated import rms_norm_gated
+try:
+    import triton  # noqa: F401 -- guards the submodules below
+
+    from prometheus.kernel.fla.chunk import chunk_gated_delta_rule
+    from prometheus.kernel.fla.fused_sigmoid_gating_recurrent import (
+        fused_sigmoid_gating_delta_rule_update,
+    )
+    from prometheus.kernel.fla.layernorm_gated import rms_norm_gated
+except ImportError:
+    # Non-CUDA host (e.g. Apple Silicon / MPS): Triton has no wheel there.
+    # Fall back to the pure-torch eager implementations.
+    from prometheus.kernel.fla.torch_fallback import (
+        chunk_gated_delta_rule,
+        fused_sigmoid_gating_delta_rule_update,
+    )
+
+    def rms_norm_gated(x, weight, eps, z=None):
+        """Eager gated RMSNorm fallback (used by GDN prefill)."""
+        t = x.to(torch.float32)
+        t = t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps)
+        t = t * weight
+        if z is not None:
+            t = t * torch.sigmoid(z)
+        return (x.dtype == torch.bfloat16 and t.to(torch.bfloat16)) or t
 
 __all__ = [
     "chunk_gated_delta_rule",

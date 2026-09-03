@@ -8,7 +8,6 @@ from typing import Iterator
 import safetensors
 import torch
 from prometheus.distributed import get_tp_info
-from prometheus.kernel.triton.nvfp4_dequant import dequant_nvfp4
 from prometheus.models.loader import (
     CT_SCALE_SUFFIXES,
     ShardReader,
@@ -144,14 +143,15 @@ def _dequant_nvfp4_weight(
     """Dense NVFP4 -> bf16 (W4A16): ``fp4 * block_scale * global_scale``. ``weight`` is
     [O, IN//2] uint8, ``weight_scale`` [O, IN//16] fp8-e4m3, ``weight_scale_2`` the per-tensor
     global scalar (broadcast to per-row, matching the offload-cache dequant kernel)."""
-    # The dequant kernel is GPU-only; the checkpoint-conversion path loads dense weights on
-    # CPU, so run on CUDA and return on the caller's device (no-op when already on GPU).
+    # CPU eager path: the Triton dequant kernel is CUDA-only, so on a CPU host
+    # unpack fp4 codes via a float32 LUT and apply block + global scales in torch.
+    # Mirrors the kernel's numerics: weight = e2m1(code) * block_scale * global_scale.
+    if weight.device.type != "cuda":
+        return _dequant_nvfp4_weight_cpu(weight, weight_scale, weight_scale_2)
+
+    from prometheus.kernel.triton.nvfp4_dequant import dequant_nvfp4
+
     orig_device = weight.device
-    if orig_device.type != "cuda":
-        dev = torch.device("cuda")
-        weight, weight_scale, weight_scale_2 = (
-            weight.to(dev), weight_scale.to(dev), weight_scale_2.to(dev)
-        )
     out_features = weight.shape[0]
     global_scale = weight_scale_2.reshape(1).to(torch.float16).expand(out_features).contiguous()
     slots = torch.zeros(1, dtype=torch.int32, device=weight.device)
@@ -163,6 +163,61 @@ def _dequant_nvfp4_weight(
         dtype=torch.bfloat16,
     )[0]
     return out.to(orig_device)
+
+
+# E2M1 (NVFP4) value table indexed by the 4-bit code.
+_E2M1_VALUES = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+]
+
+
+def _dequant_nvfp4_weight_cpu(
+    weight: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2: torch.Tensor
+) -> torch.Tensor:
+    """CPU eager NVFP4 dequant mirroring the Triton kernel's numerics.
+
+    ``weight``     [O, IN//2] uint8  -- two 4-bit E2M1 codes per byte (high nibble first)
+    ``weight_scale`` [O, IN//16] fp8-e4m3 -- one block scale per 16 input elements
+    ``weight_scale_2`` per-tensor (or per-row) global scalar
+    """
+    out_features, in_packed = weight.shape
+    in_features = in_packed * 2
+    num_blocks = weight_scale.shape[1] if weight_scale.dim() > 1 else 1
+
+    # Unpack two 4-bit codes per byte (high nibble first, matching the kernel).
+    w = weight.to(torch.int32)
+    code_hi = (w >> 4) & 0xF
+    code_lo = w & 0xF
+    # Interleave: byte i -> elements 2i (hi), 2i+1 (lo).
+    codes = torch.stack((code_hi, code_lo), dim=-1).reshape(out_features, in_features)
+
+    # E2M1 lookup -> fp32 values.
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=codes.device)
+    fp4 = lut[codes.long()]  # [O, IN] fp32
+
+    # Per-block fp8-e4m3 scale -> fp32, broadcast across each 16-element block.
+    # Decode e4m3 bits (uint8) to fp32 on CPU: place exp+mantissa in the fp16 field
+    # (exact, incl. e4m3 subnormals) and rescale by 2^(15-7). NaN codes -> +-480.
+    v = weight_scale.to(torch.int32)
+    h = ((v & 0x80) << 8) | ((v & 0x7F) << 7)
+    block_scale = h.view(torch.float16).to(torch.float32) * 256.0  # [O, IN//16]
+    # Expand to per-element: repeat each block scale 16 times along the last dim.
+    block_scale = block_scale.unsqueeze(-1).expand(-1, -1, 16).reshape(
+        out_features, num_blocks * 16
+    )[:, :in_features].contiguous()
+
+    # Global scale: one scalar broadcast to every row (per-row if weight_scale_2 has
+    # out_features entries; the kernel broadcasts per-row either way).
+    if weight_scale_2.numel() == 1:
+        global_scale = weight_scale_2.to(torch.float32)
+    else:
+        global_scale = weight_scale_2.to(torch.float32).view(-1, 1).expand(
+            out_features, in_features
+        ).contiguous()
+
+    out = fp4 * block_scale * global_scale
+    return out.to(torch.bfloat16)
 
 
 def _load_maybe_quantized(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
